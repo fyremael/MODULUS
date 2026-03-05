@@ -1,0 +1,11 @@
+# Core runtime (validated on 2026-03-04)
+jax==0.4.38
+jaxlib==0.4.38
+optax==0.2.5
+
+# Optional runtime for demos/examples requiring Flax
+# Install separately when needed:
+# python -m pip install "flax==0.10.4"
+
+# Dev/test
+pytest==8.3.5

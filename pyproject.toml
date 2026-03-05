@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modulus-hyperball"
+version = "0.1.0"
+description = "JAX/Optax Hyperball optimization and LoRA steering toolkit."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "MODULUS IP HOLDINGS" }]
+dependencies = [
+  "jax==0.4.38",
+  "jaxlib==0.4.38",
+  "optax==0.2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.3.5",
+  "ruff==0.9.10",
+]
+examples = [
+  "flax==0.10.4",
+]
+report = [
+  "matplotlib==3.10.1",
+]
+all = [
+  "pytest==8.3.5",
+  "ruff==0.9.10",
+  "flax==0.10.4",
+  "matplotlib==3.10.1",
+]
+
+[tool.setuptools.packages.find]
+include = ["modulus*"]
+exclude = ["modulus.tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["modulus/tests"]
+addopts = "-p no:cacheprovider -q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

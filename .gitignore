@@ -1,0 +1,20 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Pytest cache
+.pytest_cache/
+pytest-cache-files-*/
+
+# Build / packaging
+*.egg-info/
+build/
+dist/
+
+# Benchmark run outputs (keep docs, ignore generated runs)
+artifacts/benchmarks/
+
+# Local lint artifacts
+artifacts/lint/
