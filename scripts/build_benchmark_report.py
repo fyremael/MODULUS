@@ -63,12 +63,22 @@ def _build_rankings(summary_rows: Sequence[Dict[str, str]]) -> List[Dict[str, An
     baseline = _baseline_row(summary_rows)
     base_loss = _parse_float(baseline["final_loss"]) if baseline else float("nan")
     base_ms = _parse_float(baseline["avg_step_ms"]) if baseline else float("nan")
+    base_eval_loss = (
+        _parse_float(baseline.get("final_eval_loss", "nan")) if baseline else float("nan")
+    )
 
     parsed: List[Dict[str, Any]] = []
     for row in summary_rows:
         final_loss = _parse_float(row["final_loss"])
         avg_step_ms = _parse_float(row["avg_step_ms"])
+        final_eval_loss = _parse_float(row.get("final_eval_loss", "nan"))
+        avg_tokens_per_s = _parse_float(row.get("avg_tokens_per_s", "nan"))
         loss_delta = final_loss - base_loss if not math.isnan(base_loss) else float("nan")
+        eval_loss_delta = (
+            final_eval_loss - base_eval_loss
+            if (not math.isnan(final_eval_loss) and not math.isnan(base_eval_loss))
+            else float("nan")
+        )
         speed_ratio = (
             (avg_step_ms / base_ms) if (not math.isnan(base_ms) and base_ms > 0.0) else float("nan")
         )
@@ -79,8 +89,11 @@ def _build_rankings(summary_rows: Sequence[Dict[str, str]]) -> List[Dict[str, An
                 "grouped": int(row["grouped"]),
                 "lora_hook_on": int(row["lora_hook_on"]),
                 "final_loss": final_loss,
+                "final_eval_loss": final_eval_loss,
                 "avg_step_ms": avg_step_ms,
+                "avg_tokens_per_s": avg_tokens_per_s,
                 "loss_delta_vs_baseline": loss_delta,
+                "eval_loss_delta_vs_baseline": eval_loss_delta,
                 "speed_ratio_vs_baseline": speed_ratio,
                 "final_hyperball_angle_mean": _parse_float(
                     row.get("final_hyperball_angle_mean", "nan")
@@ -91,7 +104,12 @@ def _build_rankings(summary_rows: Sequence[Dict[str, str]]) -> List[Dict[str, An
             }
         )
 
-    parsed.sort(key=lambda x: (x["final_loss"], x["avg_step_ms"]))
+    def sort_key(x: Dict[str, Any]) -> Tuple[float, float, float]:
+        eval_loss = x["final_eval_loss"]
+        rank_eval = eval_loss if not math.isnan(eval_loss) else x["final_loss"]
+        return (rank_eval, x["final_loss"], x["avg_step_ms"])
+
+    parsed.sort(key=sort_key)
     return parsed
 
 
@@ -158,14 +176,17 @@ def _emit_plots(
     fig2 = plt.figure(figsize=(7, 5))
     ax2 = fig2.add_subplot(111)
     xs = [r["avg_step_ms"] for r in ranking_rows]
-    ys = [r["final_loss"] for r in ranking_rows]
+    ys = [
+        r["final_eval_loss"] if not math.isnan(r["final_eval_loss"]) else r["final_loss"]
+        for r in ranking_rows
+    ]
     labels = [r["config"] for r in ranking_rows]
     ax2.scatter(xs, ys)
     for x, y, label in zip(xs, ys, labels):
         ax2.annotate(label, (x, y), fontsize=8, xytext=(4, 3), textcoords="offset points")
-    ax2.set_title("Speed vs Final Loss")
+    ax2.set_title("Speed vs Final Eval Loss (fallback: train loss)")
     ax2.set_xlabel("Average Step Time (ms)")
-    ax2.set_ylabel("Final Loss")
+    ax2.set_ylabel("Final Eval Loss")
     ax2.grid(alpha=0.3)
     tradeoff_plot = out_dir / "speed_vs_loss.png"
     fig2.tight_layout()
@@ -195,16 +216,19 @@ def _write_markdown(
     lines.append("## Ranking (lower loss first)")
     lines.append("")
     lines.append(
-        "| config | final_loss | avg_step_ms | loss_delta_vs_baseline | speed_ratio_vs_baseline |"
+        "| config | final_eval_loss | final_loss | avg_step_ms | avg_tokens_per_s "
+        "| eval_loss_delta_vs_baseline | speed_ratio_vs_baseline |"
     )
-    lines.append("|---|---:|---:|---:|---:|")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|")
     for row in ranking_rows:
         lines.append(
-            "| {config} | {loss} | {ms} | {dloss} | {sratio} |".format(
+            "| {config} | {eval_loss} | {loss} | {ms} | {tps} | {deval} | {sratio} |".format(
                 config=row["config"],
+                eval_loss=_fmt(row["final_eval_loss"], 8),
                 loss=_fmt(row["final_loss"], 8),
                 ms=_fmt(row["avg_step_ms"], 4),
-                dloss=_fmt(row["loss_delta_vs_baseline"], 8),
+                tps=_fmt(row["avg_tokens_per_s"], 2),
+                deval=_fmt(row["eval_loss_delta_vs_baseline"], 8),
                 sratio=_fmt(row["speed_ratio_vs_baseline"], 4),
             )
         )

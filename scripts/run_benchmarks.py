@@ -5,6 +5,7 @@ import csv
 import dataclasses
 import datetime as dt
 import json
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,37 +29,180 @@ class BenchmarkConfig:
     lora_hook_on: bool
 
 
-def _model_forward(params: Mapping[str, Any], x: jnp.ndarray) -> jnp.ndarray:
-    attn = x @ params["attn"]["kernel"]
-    mlp = x @ params["mlp"]["kernel"]
-    lora = (x @ params["mlp"]["adapter"]["lora_A"]) @ params["mlp"]["adapter"]["lora_B"]
-    return attn + mlp + lora
+@dataclass(frozen=True)
+class ModelConfig:
+    width: int
+    num_layers: int
+    num_heads: int
+    seq_len: int
+    vocab_size: int
+    mlp_mult: int
+    lora_rank: int
+
+    @property
+    def head_dim(self) -> int:
+        return self.width // self.num_heads
+
+    @property
+    def mlp_hidden(self) -> int:
+        return self.width * self.mlp_mult
 
 
-def _make_initial_params(key: jax.Array, width: int, rank: int) -> Dict[str, Any]:
-    k1, k2, k3 = jax.random.split(key, 3)
-    scale = 1.0 / jnp.sqrt(float(width))
-    return {
-        "attn": {"kernel": jax.random.normal(k1, (width, width)) * scale},
-        "mlp": {
-            "kernel": jax.random.normal(k2, (width, width)) * scale,
-            "adapter": {
-                "lora_A": jax.random.normal(k3, (width, rank)) * 0.01,
-                "lora_B": jnp.zeros((rank, width), dtype=jnp.float32),
-            },
+@dataclass(frozen=True)
+class ObjectiveConfig:
+    distill_temperature: float
+    distill_weight: float
+    label_smoothing: float
+
+
+def _layer_norm(x: jnp.ndarray, scale: jnp.ndarray, eps: float = 1e-5) -> jnp.ndarray:
+    x32 = x.astype(jnp.float32)
+    mean = jnp.mean(x32, axis=-1, keepdims=True)
+    var = jnp.mean((x32 - mean) ** 2, axis=-1, keepdims=True)
+    y = (x32 - mean) / jnp.sqrt(var + eps)
+    return y * scale.astype(jnp.float32)
+
+
+def _split_heads(x: jnp.ndarray, num_heads: int) -> jnp.ndarray:
+    bsz, seqlen, width = x.shape
+    head_dim = width // num_heads
+    return x.reshape(bsz, seqlen, num_heads, head_dim).transpose(0, 2, 1, 3)
+
+
+def _merge_heads(x: jnp.ndarray) -> jnp.ndarray:
+    bsz, num_heads, seqlen, head_dim = x.shape
+    return x.transpose(0, 2, 1, 3).reshape(bsz, seqlen, num_heads * head_dim)
+
+
+def _causal_mask(seq_len: int) -> jnp.ndarray:
+    return jnp.tril(jnp.ones((seq_len, seq_len), dtype=bool))[None, None, :, :]
+
+
+def _model_forward(
+    params: Mapping[str, Any],
+    tokens: jnp.ndarray,
+    *,
+    model_cfg: ModelConfig,
+    causal_mask: jnp.ndarray,
+    use_lora: bool,
+) -> jnp.ndarray:
+    bsz, seqlen = tokens.shape
+    del bsz
+
+    x = params["embed"]["token_embedding"][tokens]
+    x = x + params["embed"]["pos_embedding"][None, :seqlen, :]
+    x = x.astype(jnp.float32)
+
+    for layer_idx in range(model_cfg.num_layers):
+        blk = params[f"block_{layer_idx}"]
+
+        h = _layer_norm(x, blk["norm1"]["scale"])
+        qkv = h @ blk["attn"]["qkv_kernel"]
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+
+        qh = _split_heads(q, model_cfg.num_heads)
+        kh = _split_heads(k, model_cfg.num_heads)
+        vh = _split_heads(v, model_cfg.num_heads)
+
+        logits = jnp.einsum("bhqd,bhkd->bhqk", qh, kh) / math.sqrt(float(model_cfg.head_dim))
+        logits = jnp.where(causal_mask[:, :, :seqlen, :seqlen], logits, -1e30)
+        attn = jax.nn.softmax(logits, axis=-1)
+        attn_ctx = jnp.einsum("bhqk,bhkd->bhqd", attn, vh)
+        attn_out = _merge_heads(attn_ctx) @ blk["attn"]["out_kernel"]
+        x = x + attn_out
+
+        h2 = _layer_norm(x, blk["norm2"]["scale"])
+        mlp = jax.nn.gelu(h2 @ blk["mlp"]["up_kernel"], approximate=False)
+        mlp = mlp @ blk["mlp"]["down_kernel"]
+
+        if use_lora:
+            lora = (h2 @ blk["mlp"]["adapter"]["lora_A"]) @ blk["mlp"]["adapter"]["lora_B"]
+            mlp = mlp + lora
+
+        x = x + mlp
+
+    x = _layer_norm(x, params["final_norm"]["scale"])
+    return x @ params["lm_head"]["kernel"]
+
+
+def _make_initial_params(key: jax.Array, model_cfg: ModelConfig) -> Dict[str, Any]:
+    keys = iter(jax.random.split(key, 6 + model_cfg.num_layers * 8))
+
+    def next_key() -> jax.Array:
+        return next(keys)
+
+    w_scale = 1.0 / math.sqrt(float(model_cfg.width))
+    mlp_up_scale = 1.0 / math.sqrt(float(model_cfg.width))
+    mlp_down_scale = 1.0 / math.sqrt(float(model_cfg.mlp_hidden))
+
+    params: Dict[str, Any] = {
+        "embed": {
+            "token_embedding": jax.random.normal(
+                next_key(), (model_cfg.vocab_size, model_cfg.width)
+            ).astype(jnp.float32)
+            * 0.02,
+            "pos_embedding": jax.random.normal(
+                next_key(), (model_cfg.seq_len, model_cfg.width)
+            ).astype(jnp.float32)
+            * 0.01,
         },
-        # Included for realistic group/mask behavior even though not used in loss.
-        "embed": {"embedding": jax.random.normal(k1, (128, width)) * 0.01},
-        "LayerNorm_0": {"scale": jnp.ones((width,), dtype=jnp.float32)},
+        "final_norm": {"scale": jnp.ones((model_cfg.width,), dtype=jnp.float32)},
+        "lm_head": {
+            "kernel": jax.random.normal(next_key(), (model_cfg.width, model_cfg.vocab_size)).astype(
+                jnp.float32
+            )
+            * w_scale
+        },
     }
 
+    for layer_idx in range(model_cfg.num_layers):
+        params[f"block_{layer_idx}"] = {
+            "attn": {
+                "qkv_kernel": jax.random.normal(
+                    next_key(), (model_cfg.width, 3 * model_cfg.width)
+                ).astype(jnp.float32)
+                * w_scale,
+                "out_kernel": jax.random.normal(
+                    next_key(), (model_cfg.width, model_cfg.width)
+                ).astype(jnp.float32)
+                * w_scale,
+            },
+            "mlp": {
+                "up_kernel": jax.random.normal(
+                    next_key(), (model_cfg.width, model_cfg.mlp_hidden)
+                ).astype(jnp.float32)
+                * mlp_up_scale,
+                "down_kernel": jax.random.normal(
+                    next_key(), (model_cfg.mlp_hidden, model_cfg.width)
+                ).astype(jnp.float32)
+                * mlp_down_scale,
+                "adapter": {
+                    "lora_A": jax.random.normal(
+                        next_key(), (model_cfg.width, model_cfg.lora_rank)
+                    ).astype(jnp.float32)
+                    * 0.01,
+                    "lora_B": jnp.zeros((model_cfg.lora_rank, model_cfg.width), dtype=jnp.float32),
+                },
+            },
+            "norm1": {"scale": jnp.ones((model_cfg.width,), dtype=jnp.float32)},
+            "norm2": {"scale": jnp.ones((model_cfg.width,), dtype=jnp.float32)},
+        }
 
-def _make_teacher(key: jax.Array, width: int) -> jnp.ndarray:
-    return jax.random.normal(key, (width, width)) * (1.0 / jnp.sqrt(float(width)))
+    return params
 
 
-def _build_optimizer(cfg: BenchmarkConfig, params: Mapping[str, Any], lr: float, wd: float):
-    base = optax.adamw(learning_rate=lr, weight_decay=wd)
+def _build_optimizer(
+    cfg: BenchmarkConfig,
+    params: Mapping[str, Any],
+    *,
+    lr: float,
+    wd: float,
+    grad_clip_norm: float,
+):
+    base = optax.chain(
+        optax.clip_by_global_norm(grad_clip_norm),
+        optax.adamw(learning_rate=lr, weight_decay=wd),
+    )
     mask_fn = default_llm_hyperball_mask(
         include_embeddings=False, exclude_lora=True, exclude_1d=True
     )
@@ -115,9 +259,69 @@ def _build_optimizer(cfg: BenchmarkConfig, params: Mapping[str, Any], lr: float,
     )(params)
 
 
-def _loss(params: Mapping[str, Any], x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    pred = _model_forward(params, x)
-    return jnp.mean((pred - y) ** 2)
+def _next_token_ce(
+    logits: jnp.ndarray,
+    tokens: jnp.ndarray,
+    *,
+    label_smoothing: float,
+) -> jnp.ndarray:
+    logits_next = logits[:, :-1, :]
+    labels_next = tokens[:, 1:]
+    if label_smoothing <= 0.0:
+        return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits_next, labels_next))
+
+    vocab = logits_next.shape[-1]
+    one_hot = jax.nn.one_hot(labels_next, num_classes=vocab, dtype=jnp.float32)
+    smooth = label_smoothing / float(vocab)
+    target = one_hot * (1.0 - label_smoothing) + smooth
+    log_probs = jax.nn.log_softmax(logits_next, axis=-1)
+    return -jnp.mean(jnp.sum(target * log_probs, axis=-1))
+
+
+def _objective(
+    params: Mapping[str, Any],
+    teacher_params: Mapping[str, Any],
+    tokens: jnp.ndarray,
+    *,
+    model_cfg: ModelConfig,
+    objective_cfg: ObjectiveConfig,
+    causal_mask: jnp.ndarray,
+) -> tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
+    student_logits = _model_forward(
+        params,
+        tokens,
+        model_cfg=model_cfg,
+        causal_mask=causal_mask,
+        use_lora=True,
+    )
+    teacher_logits = jax.lax.stop_gradient(
+        _model_forward(
+            teacher_params,
+            tokens,
+            model_cfg=model_cfg,
+            causal_mask=causal_mask,
+            use_lora=False,
+        )
+    )
+
+    temp = jnp.asarray(objective_cfg.distill_temperature, dtype=jnp.float32)
+    student_log_probs = jax.nn.log_softmax(student_logits / temp, axis=-1)
+    teacher_probs = jax.nn.softmax(teacher_logits / temp, axis=-1)
+    teacher_log_probs = jax.nn.log_softmax(teacher_logits / temp, axis=-1)
+    distill_kl = jnp.mean(
+        jnp.sum(teacher_probs * (teacher_log_probs - student_log_probs), axis=-1)
+    ) * (temp**2)
+
+    next_token_ce = _next_token_ce(
+        student_logits,
+        tokens,
+        label_smoothing=objective_cfg.label_smoothing,
+    )
+    total = (
+        objective_cfg.distill_weight * distill_kl
+        + (1.0 - objective_cfg.distill_weight) * next_token_ce
+    )
+    return total, {"distill_kl": distill_kl, "next_token_ce": next_token_ce}
 
 
 def _find_hyperball_metric_maps(root: Any) -> List[Mapping[str, Any]]:
@@ -167,16 +371,93 @@ def _aggregate_hyperball_metrics(opt_state: Any) -> Dict[str, float]:
     return {k: sum(vals) / len(vals) for k, vals in merged.items()}
 
 
-def _make_step_fn(tx, lora_hook_on: bool):
-    def step_fn(params, opt_state, x, y):
-        loss_val, grads = jax.value_and_grad(_loss)(params, x, y)
+def _make_step_fn(
+    tx: optax.GradientTransformation,
+    teacher_params: Mapping[str, Any],
+    *,
+    lora_hook_on: bool,
+    model_cfg: ModelConfig,
+    objective_cfg: ObjectiveConfig,
+    grad_accum_steps: int,
+    causal_mask: jnp.ndarray,
+):
+    def loss_with_aux(p, tok):
+        return _objective(
+            p,
+            teacher_params,
+            tok,
+            model_cfg=model_cfg,
+            objective_cfg=objective_cfg,
+            causal_mask=causal_mask,
+        )
+
+    def step_fn(params, opt_state, tokens):
+        if grad_accum_steps == 1:
+            (loss_val, aux), grads = jax.value_and_grad(loss_with_aux, has_aux=True)(params, tokens)
+        else:
+            micro_bs = tokens.shape[0] // grad_accum_steps
+            tokens_micro = tokens.reshape((grad_accum_steps, micro_bs, tokens.shape[1]))
+            grads = jax.tree.map(jnp.zeros_like, params)
+            loss_val = jnp.asarray(0.0, dtype=jnp.float32)
+            distill_kl = jnp.asarray(0.0, dtype=jnp.float32)
+            next_token_ce = jnp.asarray(0.0, dtype=jnp.float32)
+
+            for i in range(grad_accum_steps):
+                (loss_i, aux_i), grads_i = jax.value_and_grad(loss_with_aux, has_aux=True)(
+                    params, tokens_micro[i]
+                )
+                grads = jax.tree.map(lambda a, b: a + b, grads, grads_i)
+                loss_val = loss_val + loss_i
+                distill_kl = distill_kl + aux_i["distill_kl"]
+                next_token_ce = next_token_ce + aux_i["next_token_ce"]
+
+            scale = 1.0 / float(grad_accum_steps)
+            grads = jax.tree.map(lambda g: g * scale, grads)
+            loss_val = loss_val * scale
+            aux = {
+                "distill_kl": distill_kl * scale,
+                "next_token_ce": next_token_ce * scale,
+            }
+
         if lora_hook_on:
             grads = apply_lora_grad_hook(params, grads, a_name="lora_A", b_name="lora_B", eps=1e-6)
+
+        grad_norm = optax.global_norm(grads)
         updates, new_opt_state = tx.update(grads, opt_state, params)
+        update_norm = optax.global_norm(updates)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, loss_val
+        return (
+            new_params,
+            new_opt_state,
+            loss_val,
+            aux["next_token_ce"],
+            aux["distill_kl"],
+            grad_norm,
+            update_norm,
+        )
 
     return jax.jit(step_fn)
+
+
+def _make_eval_fn(
+    teacher_params: Mapping[str, Any],
+    *,
+    model_cfg: ModelConfig,
+    objective_cfg: ObjectiveConfig,
+    causal_mask: jnp.ndarray,
+):
+    def eval_fn(params, tokens):
+        loss_val, aux = _objective(
+            params,
+            teacher_params,
+            tokens,
+            model_cfg=model_cfg,
+            objective_cfg=objective_cfg,
+            causal_mask=causal_mask,
+        )
+        return loss_val, aux["next_token_ce"], aux["distill_kl"]
+
+    return jax.jit(eval_fn)
 
 
 def _timestamp_dir(base_dir: Path) -> Path:
@@ -194,11 +475,89 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], fieldnames: Sequen
             writer.writerow(r)
 
 
+def _make_token_batches(
+    key: jax.Array,
+    *,
+    num_batches: int,
+    batch_size: int,
+    seq_len: int,
+    vocab_size: int,
+    shift_start_batch: int,
+    rare_inject_prob: float,
+) -> jnp.ndarray:
+    k_base, k_shift, k_mix, k_rare = jax.random.split(key, 4)
+    ranks = jnp.arange(vocab_size, dtype=jnp.float32) + 1.0
+    base_logits = -1.10 * jnp.log(ranks)
+    shifted_logits = base_logits + jnp.where(
+        jnp.arange(vocab_size) >= (vocab_size // 2),
+        1.20,
+        -0.25,
+    ).astype(jnp.float32)
+
+    base_tokens = jax.random.categorical(
+        k_base,
+        base_logits,
+        shape=(num_batches, batch_size, seq_len),
+    ).astype(jnp.int32)
+    shifted_tokens = jax.random.categorical(
+        k_shift,
+        shifted_logits,
+        shape=(num_batches, batch_size, seq_len),
+    ).astype(jnp.int32)
+
+    phase_mask = jnp.arange(num_batches)[:, None, None] >= shift_start_batch
+    tokens = jnp.where(phase_mask, shifted_tokens, base_tokens)
+
+    rare_bucket = max(vocab_size // 8, 1)
+    rare_start = max(vocab_size - rare_bucket, 0)
+    rare_start = min(rare_start, vocab_size - 1)
+    rare_tokens = jax.random.randint(
+        k_rare,
+        shape=tokens.shape,
+        minval=rare_start,
+        maxval=vocab_size,
+        dtype=jnp.int32,
+    )
+    inject_mask = jax.random.bernoulli(k_mix, p=rare_inject_prob, shape=tokens.shape)
+    return jnp.where(inject_mask, rare_tokens, tokens).astype(jnp.int32)
+
+
 def run(args: argparse.Namespace) -> None:
+    if args.width % args.num_heads != 0:
+        raise ValueError("--width must be divisible by --num-heads")
+    if args.batch_size % args.grad_accum_steps != 0:
+        raise ValueError("--batch-size must be divisible by --grad-accum-steps")
+    if args.seq_len < 2:
+        raise ValueError("--seq-len must be >= 2 for next-token objective")
+    if args.vocab_size < 16:
+        raise ValueError("--vocab-size must be >= 16")
+    if not (0.0 <= args.distill_weight <= 1.0):
+        raise ValueError("--distill-weight must be in [0, 1]")
+    if not (0.0 <= args.label_smoothing < 1.0):
+        raise ValueError("--label-smoothing must be in [0, 1)")
+    if not (0.0 <= args.shift_start_frac <= 1.0):
+        raise ValueError("--shift-start-frac must be in [0, 1]")
+
     root = Path(__file__).resolve().parents[1]
     out_root = root / "artifacts" / "benchmarks"
     out_dir = _timestamp_dir(out_root) if args.out_dir is None else Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    model_cfg = ModelConfig(
+        width=args.width,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        seq_len=args.seq_len,
+        vocab_size=args.vocab_size,
+        mlp_mult=args.mlp_mult,
+        lora_rank=args.lora_rank,
+    )
+    objective_cfg = ObjectiveConfig(
+        distill_temperature=args.distill_temperature,
+        distill_weight=args.distill_weight,
+        label_smoothing=args.label_smoothing,
+    )
+    mask = _causal_mask(args.seq_len)
 
     configs = [
         BenchmarkConfig("baseline", hyperball_on=False, grouped=False, lora_hook_on=False),
@@ -212,46 +571,127 @@ def run(args: argparse.Namespace) -> None:
         ),
     ]
 
-    rng = jax.random.PRNGKey(args.seed)
-    k_params, k_teacher, k_batch = jax.random.split(rng, 3)
-    init_params = _make_initial_params(k_params, width=args.width, rank=args.lora_rank)
-    teacher = _make_teacher(k_teacher, width=args.width)
+    total_batches = args.steps + args.warmup_steps
+    shift_start_batch = int(total_batches * args.shift_start_frac)
 
-    # Fixed batches keep benchmark comparisons fair.
-    x_all = jax.random.normal(
-        k_batch, (args.steps + args.warmup_steps, args.batch_size, args.width)
+    rng = jax.random.PRNGKey(args.seed)
+    k_student, k_teacher, k_train, k_eval = jax.random.split(rng, 4)
+    init_params = _make_initial_params(k_student, model_cfg=model_cfg)
+    teacher_params = _make_initial_params(k_teacher, model_cfg=model_cfg)
+    train_tokens = _make_token_batches(
+        k_train,
+        num_batches=total_batches,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        vocab_size=args.vocab_size,
+        shift_start_batch=shift_start_batch,
+        rare_inject_prob=args.train_rare_token_prob,
     )
-    y_all = jnp.einsum("tbd,df->tbf", x_all, teacher)
+    eval_tokens = _make_token_batches(
+        k_eval,
+        num_batches=args.eval_batches,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        vocab_size=args.vocab_size,
+        shift_start_batch=0,
+        rare_inject_prob=args.eval_rare_token_prob,
+    )
 
     step_rows: List[Dict[str, Any]] = []
     summary_rows: List[Dict[str, Any]] = []
 
     for cfg in configs:
         params = jax.tree.map(lambda z: jnp.array(z, copy=True), init_params)
-        tx = _build_optimizer(cfg, params=params, lr=args.lr, wd=args.weight_decay)
+        tx = _build_optimizer(
+            cfg,
+            params=params,
+            lr=args.lr,
+            wd=args.weight_decay,
+            grad_clip_norm=args.grad_clip_norm,
+        )
         opt_state = tx.init(params)
-        step_fn = _make_step_fn(tx=tx, lora_hook_on=cfg.lora_hook_on)
+        step_fn = _make_step_fn(
+            tx=tx,
+            teacher_params=teacher_params,
+            lora_hook_on=cfg.lora_hook_on,
+            model_cfg=model_cfg,
+            objective_cfg=objective_cfg,
+            grad_accum_steps=args.grad_accum_steps,
+            causal_mask=mask,
+        )
+        eval_fn = _make_eval_fn(
+            teacher_params=teacher_params,
+            model_cfg=model_cfg,
+            objective_cfg=objective_cfg,
+            causal_mask=mask,
+        )
 
-        # JIT warmup (excluded from timed rows).
+        # JIT warmup (excluded from timing rows).
         for i in range(args.warmup_steps):
-            params, opt_state, loss_val = step_fn(params, opt_state, x_all[i], y_all[i])
+            params, opt_state, loss_val, ce_val, kl_val, grad_norm, update_norm = step_fn(
+                params, opt_state, train_tokens[i]
+            )
             jax.block_until_ready(loss_val)
+            jax.block_until_ready(ce_val)
+            jax.block_until_ready(kl_val)
+            jax.block_until_ready(grad_norm)
+            jax.block_until_ready(update_norm)
 
-        loss_last = None
+        loss_last = float("nan")
+        ce_last = float("nan")
+        kl_last = float("nan")
+        best_eval_loss = float("inf")
+        final_eval_loss = float("nan")
         step_ms_total = 0.0
-        hb_last = {}
+        tokens_per_s_total = 0.0
+        grad_norm_total = 0.0
+        update_norm_total = 0.0
+        hb_last: Dict[str, float] = {}
 
         for step in range(args.steps):
-            x = x_all[args.warmup_steps + step]
-            y = y_all[args.warmup_steps + step]
-
+            tokens = train_tokens[args.warmup_steps + step]
             t0 = time.perf_counter()
-            params, opt_state, loss_val = step_fn(params, opt_state, x, y)
+            params, opt_state, loss_val, ce_val, kl_val, grad_norm, update_norm = step_fn(
+                params, opt_state, tokens
+            )
             jax.block_until_ready(loss_val)
+            jax.block_until_ready(ce_val)
+            jax.block_until_ready(kl_val)
+            jax.block_until_ready(grad_norm)
+            jax.block_until_ready(update_norm)
             step_ms = (time.perf_counter() - t0) * 1000.0
+            tokens_per_s = (args.batch_size * args.seq_len) / max(step_ms / 1000.0, 1e-9)
 
-            hb_metrics = _aggregate_hyperball_metrics(opt_state)
             loss_scalar = float(loss_val)
+            ce_scalar = float(ce_val)
+            kl_scalar = float(kl_val)
+            grad_norm_scalar = float(grad_norm)
+            update_norm_scalar = float(update_norm)
+            hb_metrics = _aggregate_hyperball_metrics(opt_state)
+
+            eval_loss = float("nan")
+            eval_ce = float("nan")
+            eval_kl = float("nan")
+            should_eval = args.eval_interval > 0 and (
+                (step + 1) % args.eval_interval == 0 or step == (args.steps - 1)
+            )
+            if should_eval:
+                eval_loss_acc = 0.0
+                eval_ce_acc = 0.0
+                eval_kl_acc = 0.0
+                for eval_idx in range(args.eval_batches):
+                    loss_eval, ce_eval, kl_eval = eval_fn(params, eval_tokens[eval_idx])
+                    loss_eval = float(jax.block_until_ready(loss_eval))
+                    ce_eval = float(jax.block_until_ready(ce_eval))
+                    kl_eval = float(jax.block_until_ready(kl_eval))
+                    eval_loss_acc += loss_eval
+                    eval_ce_acc += ce_eval
+                    eval_kl_acc += kl_eval
+                eval_loss = eval_loss_acc / float(args.eval_batches)
+                eval_ce = eval_ce_acc / float(args.eval_batches)
+                eval_kl = eval_kl_acc / float(args.eval_batches)
+                final_eval_loss = eval_loss
+                best_eval_loss = min(best_eval_loss, eval_loss)
 
             row = {
                 "config": cfg.name,
@@ -260,7 +700,15 @@ def run(args: argparse.Namespace) -> None:
                 "lora_hook_on": int(cfg.lora_hook_on),
                 "step": step,
                 "loss": f"{loss_scalar:.8f}",
+                "next_token_ce": f"{ce_scalar:.8f}",
+                "distill_kl": f"{kl_scalar:.8f}",
                 "step_ms": f"{step_ms:.4f}",
+                "tokens_per_s": f"{tokens_per_s:.2f}",
+                "grad_norm": f"{grad_norm_scalar:.8f}",
+                "update_norm": f"{update_norm_scalar:.8f}",
+                "eval_loss": f"{eval_loss:.8f}",
+                "eval_next_token_ce": f"{eval_ce:.8f}",
+                "eval_distill_kl": f"{eval_kl:.8f}",
                 "hyperball_angle_mean": (
                     f"{hb_metrics.get('hyperball/angle_mean', float('nan')):.8f}"
                 ),
@@ -269,8 +717,14 @@ def run(args: argparse.Namespace) -> None:
                 ),
             }
             step_rows.append(row)
+
             loss_last = loss_scalar
+            ce_last = ce_scalar
+            kl_last = kl_scalar
             step_ms_total += step_ms
+            tokens_per_s_total += tokens_per_s
+            grad_norm_total += grad_norm_scalar
+            update_norm_total += update_norm_scalar
             hb_last = hb_metrics
 
         summary_rows.append(
@@ -280,8 +734,15 @@ def run(args: argparse.Namespace) -> None:
                 "grouped": int(cfg.grouped),
                 "lora_hook_on": int(cfg.lora_hook_on),
                 "steps": args.steps,
-                "final_loss": f"{(loss_last if loss_last is not None else float('nan')):.8f}",
+                "final_loss": f"{loss_last:.8f}",
+                "final_next_token_ce": f"{ce_last:.8f}",
+                "final_distill_kl": f"{kl_last:.8f}",
+                "final_eval_loss": f"{final_eval_loss:.8f}",
+                "best_eval_loss": f"{best_eval_loss:.8f}",
                 "avg_step_ms": f"{(step_ms_total / max(args.steps, 1)):.4f}",
+                "avg_tokens_per_s": f"{(tokens_per_s_total / max(args.steps, 1)):.2f}",
+                "avg_grad_norm": f"{(grad_norm_total / max(args.steps, 1)):.8f}",
+                "avg_update_norm": f"{(update_norm_total / max(args.steps, 1)):.8f}",
                 "final_hyperball_angle_mean": (
                     f"{hb_last.get('hyperball/angle_mean', float('nan')):.8f}"
                 ),
@@ -305,7 +766,15 @@ def run(args: argparse.Namespace) -> None:
             "lora_hook_on",
             "step",
             "loss",
+            "next_token_ce",
+            "distill_kl",
             "step_ms",
+            "tokens_per_s",
+            "grad_norm",
+            "update_norm",
+            "eval_loss",
+            "eval_next_token_ce",
+            "eval_distill_kl",
             "hyperball_angle_mean",
             "hyperball_radial_frac_mean",
         ],
@@ -320,7 +789,14 @@ def run(args: argparse.Namespace) -> None:
             "lora_hook_on",
             "steps",
             "final_loss",
+            "final_next_token_ce",
+            "final_distill_kl",
+            "final_eval_loss",
+            "best_eval_loss",
             "avg_step_ms",
+            "avg_tokens_per_s",
+            "avg_grad_norm",
+            "avg_update_norm",
             "final_hyperball_angle_mean",
             "final_hyperball_radial_frac_mean",
         ],
@@ -329,13 +805,25 @@ def run(args: argparse.Namespace) -> None:
     meta = {
         "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "seed": args.seed,
-        "width": args.width,
-        "lora_rank": args.lora_rank,
         "batch_size": args.batch_size,
         "steps": args.steps,
         "warmup_steps": args.warmup_steps,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
+        "grad_clip_norm": args.grad_clip_norm,
+        "grad_accum_steps": args.grad_accum_steps,
+        "eval_interval": args.eval_interval,
+        "eval_batches": args.eval_batches,
+        "shift_start_frac": args.shift_start_frac,
+        "train_rare_token_prob": args.train_rare_token_prob,
+        "eval_rare_token_prob": args.eval_rare_token_prob,
+        "distill_temperature": args.distill_temperature,
+        "distill_weight": args.distill_weight,
+        "label_smoothing": args.label_smoothing,
+        "model": dataclasses.asdict(model_cfg),
+        "jax_version": jax.__version__,
+        "jax_backend": jax.default_backend(),
+        "jax_devices": [str(d) for d in jax.devices()],
         "output_dir": str(out_dir),
     }
     meta_json.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -349,22 +837,42 @@ def run(args: argparse.Namespace) -> None:
         angle = r["final_hyperball_angle_mean"]
         radial = r["final_hyperball_radial_frac_mean"]
         print(
-            f"- {r['config']}: final_loss={r['final_loss']}, avg_step_ms={r['avg_step_ms']}, "
+            f"- {r['config']}: final_loss={r['final_loss']}, "
+            f"final_eval_loss={r['final_eval_loss']}, "
+            f"avg_step_ms={r['avg_step_ms']}, avg_tokens_per_s={r['avg_tokens_per_s']}, "
             f"angle={angle}, radial={radial}"
         )
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Run MODULUS ablation benchmarks and emit CSV artifacts."
+        description=(
+            "Run realistic MODULUS ablation benchmarks with sequence-model distillation, "
+            "distribution shift, and evaluation passes."
+        )
     )
-    p.add_argument("--steps", type=int, default=60)
-    p.add_argument("--warmup-steps", type=int, default=5)
+    p.add_argument("--steps", type=int, default=40)
+    p.add_argument("--warmup-steps", type=int, default=6)
     p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--width", type=int, default=128)
+    p.add_argument("--seq-len", type=int, default=128)
+    p.add_argument("--width", type=int, default=256)
+    p.add_argument("--num-layers", type=int, default=4)
+    p.add_argument("--num-heads", type=int, default=8)
+    p.add_argument("--mlp-mult", type=int, default=4)
+    p.add_argument("--vocab-size", type=int, default=8192)
     p.add_argument("--lora-rank", type=int, default=8)
+    p.add_argument("--grad-accum-steps", type=int, default=2)
+    p.add_argument("--eval-interval", type=int, default=5)
+    p.add_argument("--eval-batches", type=int, default=2)
+    p.add_argument("--shift-start-frac", type=float, default=0.5)
+    p.add_argument("--train-rare-token-prob", type=float, default=0.03)
+    p.add_argument("--eval-rare-token-prob", type=float, default=0.08)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-2)
+    p.add_argument("--grad-clip-norm", type=float, default=1.0)
+    p.add_argument("--distill-temperature", type=float, default=1.5)
+    p.add_argument("--distill-weight", type=float, default=0.6)
+    p.add_argument("--label-smoothing", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", type=str, default=None)
     return p.parse_args(argv)
