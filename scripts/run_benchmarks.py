@@ -242,13 +242,13 @@ def _build_optimizer(
     cfg: BenchmarkConfig,
     params: Mapping[str, Any],
     *,
-    lr: float,
+    learning_rate: Any,
     wd: float,
     grad_clip_norm: float,
 ):
     base = optax.chain(
         optax.clip_by_global_norm(grad_clip_norm),
-        optax.adamw(learning_rate=lr, weight_decay=wd),
+        optax.adamw(learning_rate=learning_rate, weight_decay=wd),
     )
     mask_fn = default_llm_hyperball_mask(
         include_embeddings=False, exclude_lora=True, exclude_1d=True
@@ -304,6 +304,41 @@ def _build_optimizer(
         labels_fn=labels_fn,
         default_group="other",
     )(params)
+
+
+def _build_lr_schedule(
+    *,
+    base_lr: float,
+    schedule_name: str,
+    warmup_steps: int,
+    min_ratio: float,
+    total_steps: int,
+):
+    if schedule_name == "constant":
+        return optax.constant_schedule(base_lr)
+
+    if schedule_name == "warmup_cosine":
+        warmup = min(max(warmup_steps, 0), total_steps)
+        if warmup > 0:
+            warmup_sched = optax.linear_schedule(
+                init_value=0.0,
+                end_value=base_lr,
+                transition_steps=max(warmup, 1),
+            )
+        else:
+            warmup_sched = optax.constant_schedule(base_lr)
+        cosine_sched = optax.cosine_decay_schedule(
+            init_value=base_lr,
+            decay_steps=max(total_steps - warmup, 1),
+            alpha=min_ratio,
+        )
+        if warmup > 0:
+            return optax.join_schedules([warmup_sched, cosine_sched], [warmup])
+        return cosine_sched
+
+    raise ValueError(
+        f"Unknown --lr-schedule '{schedule_name}'. Valid: constant, warmup_cosine."
+    )
 
 
 def _next_token_ce(
@@ -927,6 +962,14 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--token-pool-batches must be >= 1")
     if args.target_runtime_minutes < 0:
         raise ValueError("--target-runtime-minutes must be >= 0")
+    if args.lr <= 0:
+        raise ValueError("--lr must be > 0")
+    if args.lr_warmup_steps < 0:
+        raise ValueError("--lr-warmup-steps must be >= 0")
+    if not (0.0 <= args.lr_min_ratio <= 1.0):
+        raise ValueError("--lr-min-ratio must be in [0, 1]")
+    if args.lr_total_steps is not None and args.lr_total_steps < 1:
+        raise ValueError("--lr-total-steps must be >= 1 when provided")
     if args.dataset_http_min_interval_sec < 0:
         raise ValueError("--dataset-http-min-interval-sec must be >= 0")
     if args.max_steps is not None and args.max_steps < args.steps:
@@ -1007,6 +1050,18 @@ def run(args: argparse.Namespace) -> None:
                 "--max-steps is smaller than steps required by --target-train-tokens. "
                 "Increase --max-steps or lower --target-train-tokens."
             )
+    min_steps = max(args.steps, target_token_steps)
+    default_lr_total_steps = args.max_steps if args.max_steps is not None else min_steps
+    lr_total_steps = (
+        int(args.lr_total_steps) if args.lr_total_steps is not None else int(default_lr_total_steps)
+    )
+    lr_fn = _build_lr_schedule(
+        base_lr=args.lr,
+        schedule_name=args.lr_schedule,
+        warmup_steps=args.lr_warmup_steps,
+        min_ratio=args.lr_min_ratio,
+        total_steps=lr_total_steps,
+    )
 
     rng = jax.random.PRNGKey(args.seed)
     k_student, k_teacher, k_train, k_eval = jax.random.split(rng, 4)
@@ -1107,13 +1162,16 @@ def run(args: argparse.Namespace) -> None:
     for cfg in configs:
         print(
             f"Starting config={cfg.name} "
-            f"(eval_interval={args.eval_interval}, log_interval={args.log_interval})"
+            f"(eval_interval={args.eval_interval}, log_interval={args.log_interval}, "
+            f"lr={args.lr:.6g}, lr_schedule={args.lr_schedule}, "
+            f"lr_warmup_steps={args.lr_warmup_steps}, lr_min_ratio={args.lr_min_ratio:.4f}, "
+            f"lr_total_steps={lr_total_steps})"
         )
         params = jax.tree.map(lambda z: jnp.array(z, copy=True), init_params)
         tx = _build_optimizer(
             cfg,
             params=params,
-            lr=args.lr,
+            learning_rate=lr_fn,
             wd=args.weight_decay,
             grad_clip_norm=args.grad_clip_norm,
         )
@@ -1146,7 +1204,6 @@ def run(args: argparse.Namespace) -> None:
             jax.block_until_ready(update_norm)
 
         target_seconds = args.target_runtime_minutes * 60.0
-        min_steps = max(args.steps, target_token_steps)
         max_steps = args.max_steps
         run_t0 = time.perf_counter()
 
@@ -1159,6 +1216,8 @@ def run(args: argparse.Namespace) -> None:
         tokens_per_s_total = 0.0
         grad_norm_total = 0.0
         update_norm_total = 0.0
+        learning_rate_total = 0.0
+        learning_rate_last = float("nan")
         hb_last: Dict[str, float] = {}
         step_count = 0
         tokens_processed = 0
@@ -1184,6 +1243,7 @@ def run(args: argparse.Namespace) -> None:
             kl_scalar = float(kl_val)
             grad_norm_scalar = float(grad_norm)
             update_norm_scalar = float(update_norm)
+            learning_rate_scalar = float(jnp.asarray(lr_fn(step)))
             hb_metrics = _aggregate_hyperball_metrics(opt_state)
 
             eval_loss = float("nan")
@@ -1223,6 +1283,7 @@ def run(args: argparse.Namespace) -> None:
                 "tokens_per_s": f"{tokens_per_s:.2f}",
                 "grad_norm": f"{grad_norm_scalar:.8f}",
                 "update_norm": f"{update_norm_scalar:.8f}",
+                "learning_rate": f"{learning_rate_scalar:.10f}",
                 "eval_loss": f"{eval_loss:.8f}",
                 "eval_next_token_ce": f"{eval_ce:.8f}",
                 "eval_distill_kl": f"{eval_kl:.8f}",
@@ -1242,6 +1303,8 @@ def run(args: argparse.Namespace) -> None:
             tokens_per_s_total += tokens_per_s
             grad_norm_total += grad_norm_scalar
             update_norm_total += update_norm_scalar
+            learning_rate_total += learning_rate_scalar
+            learning_rate_last = learning_rate_scalar
             hb_last = hb_metrics
             step_count += 1
             tokens_processed += tokens_per_step
@@ -1293,6 +1356,7 @@ def run(args: argparse.Namespace) -> None:
                     f"avg_tok_s={_fmt_metric(avg_toks_per_s, 2)}",
                     f"grad_norm={_fmt_metric(grad_norm_scalar, 6)}",
                     f"update_norm={_fmt_metric(update_norm_scalar, 6)}",
+                    f"lr={_fmt_metric(learning_rate_scalar, 8)}",
                 ]
                 if args.target_train_tokens is not None:
                     progress_parts.append(
@@ -1371,6 +1435,8 @@ def run(args: argparse.Namespace) -> None:
                 "avg_tokens_per_s": f"{(tokens_per_s_total / max(step_count, 1)):.2f}",
                 "avg_grad_norm": f"{(grad_norm_total / max(step_count, 1)):.8f}",
                 "avg_update_norm": f"{(update_norm_total / max(step_count, 1)):.8f}",
+                "avg_learning_rate": f"{(learning_rate_total / max(step_count, 1)):.10f}",
+                "final_learning_rate": f"{learning_rate_last:.10f}",
                 "final_hyperball_angle_mean": (
                     f"{hb_last.get('hyperball/angle_mean', float('nan')):.8f}"
                 ),
@@ -1400,6 +1466,7 @@ def run(args: argparse.Namespace) -> None:
             "tokens_per_s",
             "grad_norm",
             "update_norm",
+            "learning_rate",
             "eval_loss",
             "eval_next_token_ce",
             "eval_distill_kl",
@@ -1429,6 +1496,8 @@ def run(args: argparse.Namespace) -> None:
             "avg_tokens_per_s",
             "avg_grad_norm",
             "avg_update_norm",
+            "avg_learning_rate",
+            "final_learning_rate",
             "final_hyperball_angle_mean",
             "final_hyperball_radial_frac_mean",
         ],
@@ -1448,6 +1517,10 @@ def run(args: argparse.Namespace) -> None:
         "configs": [c.name for c in configs],
         "warmup_steps": args.warmup_steps,
         "lr": args.lr,
+        "lr_schedule": args.lr_schedule,
+        "lr_warmup_steps": args.lr_warmup_steps,
+        "lr_min_ratio": args.lr_min_ratio,
+        "lr_total_steps": lr_total_steps,
         "weight_decay": args.weight_decay,
         "grad_clip_norm": args.grad_clip_norm,
         "grad_accum_steps": args.grad_accum_steps,
@@ -1546,6 +1619,15 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dataset-http-min-interval-sec", type=float, default=0.35)
     p.add_argument("--dataset-http-token-env", type=str, default="HF_TOKEN")
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument(
+        "--lr-schedule",
+        type=str,
+        default="constant",
+        choices=("constant", "warmup_cosine"),
+    )
+    p.add_argument("--lr-warmup-steps", type=int, default=0)
+    p.add_argument("--lr-min-ratio", type=float, default=0.10)
+    p.add_argument("--lr-total-steps", type=int, default=None)
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--grad-clip-norm", type=float, default=1.0)
     p.add_argument("--distill-temperature", type=float, default=1.5)

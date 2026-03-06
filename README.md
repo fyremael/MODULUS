@@ -47,7 +47,11 @@ python scripts/run_benchmarks.py \
   --dataset-name HuggingFaceFW/fineweb \
   --dataset-config sample-10BT \
   --dataset-train-split train \
-  --dataset-eval-split train
+  --dataset-eval-split train \
+  --lr 6e-4 \
+  --lr-schedule warmup_cosine \
+  --lr-warmup-steps 500 \
+  --lr-min-ratio 0.10
 ```
 Note: for `hf_http`, keep `--dataset-rows-page-size` at `<=100` (HF API limit).
 For higher request budgets, set `HF_TOKEN` in the environment and the runner will
@@ -69,7 +73,12 @@ python scripts/run_benchmarks.py \
   --configs baseline \
   --target-train-tokens 1000000000 \
   --steps 1000 \
-  --max-steps 90000
+  --max-steps 90000 \
+  --lr 6e-4 \
+  --lr-schedule warmup_cosine \
+  --lr-warmup-steps 2000 \
+  --lr-min-ratio 0.10 \
+  --lr-total-steps 90000
 ```
 
 Build benchmark report from CSV artifacts:
