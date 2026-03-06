@@ -57,7 +57,7 @@ If a dataset is unavailable in your environment, switch to another public stream
 If Colab shows NumPy import errors like `_center` from `numpy._core.umath`,
 repair the runtime with:
 ```bash
-python -m pip install -U --force-reinstall --no-cache-dir "numpy>=1.26,<2.3"
+python -m pip install -U --force-reinstall --no-cache-dir "numpy==2.1.3"
 ```
 Then restart the runtime.
 

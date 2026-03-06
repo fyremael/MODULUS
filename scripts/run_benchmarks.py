@@ -614,7 +614,7 @@ def _make_hf_text_iterator(
         if _is_numpy_umath_center_error(exc):
             raise RuntimeError(
                 "Detected inconsistent NumPy installation in this Colab runtime. "
-                "Run: `%pip install -U --force-reinstall --no-cache-dir \"numpy>=1.26,<2.3\"` "
+                "Run: `%pip install -U --force-reinstall --no-cache-dir \"numpy==2.1.3\"` "
                 "then restart runtime and rerun setup."
             ) from exc
         raise RuntimeError(
@@ -642,7 +642,7 @@ def _make_hf_text_iterator(
             if _is_numpy_umath_center_error(exc):
                 raise RuntimeError(
                     "Detected inconsistent NumPy installation in this Colab runtime. "
-                    "Run: `%pip install -U --force-reinstall --no-cache-dir \"numpy>=1.26,<2.3\"` "
+                    "Run: `%pip install -U --force-reinstall --no-cache-dir \"numpy==2.1.3\"` "
                     "then restart runtime and rerun setup."
                 ) from exc
             raise RuntimeError(
@@ -653,7 +653,7 @@ def _make_hf_text_iterator(
         if _is_numpy_umath_center_error(exc):
             raise RuntimeError(
                 "Detected inconsistent NumPy installation in this Colab runtime. "
-                "Run: `%pip install -U --force-reinstall --no-cache-dir \"numpy>=1.26,<2.3\"` "
+                "Run: `%pip install -U --force-reinstall --no-cache-dir \"numpy==2.1.3\"` "
                 "then restart runtime and rerun setup."
             ) from exc
         msg = str(exc)
@@ -703,7 +703,7 @@ def _collect_stream_token_ids(
             if _is_numpy_umath_center_error(exc):
                 raise RuntimeError(
                     "Detected inconsistent NumPy installation while streaming dataset. "
-                    "Run: `%pip install -U --force-reinstall --no-cache-dir \"numpy>=1.26,<2.3\"` "
+                    "Run: `%pip install -U --force-reinstall --no-cache-dir \"numpy==2.1.3\"` "
                     "then restart runtime and rerun setup."
                 ) from exc
             raise
