@@ -60,16 +60,16 @@ If a dataset is unavailable in your environment, switch to another public stream
 (for example `--dataset-name cerebras/SlimPajama-627B`) or log in with
 `huggingface-cli login` for gated datasets.
 
-Colab TPU substantial baseline (single config, minimum wall-time budget):
+Colab TPU substantial baseline (single config, 1B-token budget):
 ```bash
 python scripts/run_benchmarks.py \
   --data-source hf_http \
-  --dataset-name JeanKaddour/minipile \
-  --dataset-config default \
+  --dataset-name HuggingFaceFW/fineweb \
+  --dataset-config sample-10BT \
   --configs baseline \
-  --target-runtime-minutes 30 \
-  --steps 400 \
-  --max-steps 5000
+  --target-train-tokens 1000000000 \
+  --steps 1000 \
+  --max-steps 90000
 ```
 
 Build benchmark report from CSV artifacts:

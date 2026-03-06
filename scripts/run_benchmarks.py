@@ -931,6 +931,8 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--dataset-http-min-interval-sec must be >= 0")
     if args.max_steps is not None and args.max_steps < args.steps:
         raise ValueError("--max-steps must be >= --steps")
+    if args.target_train_tokens is not None and args.target_train_tokens < 1:
+        raise ValueError("--target-train-tokens must be >= 1 when provided")
     if not (0.0 <= args.distill_weight <= 1.0):
         raise ValueError("--distill-weight must be in [0, 1]")
     if not (0.0 <= args.label_smoothing < 1.0):
@@ -996,6 +998,15 @@ def run(args: argparse.Namespace) -> None:
 
     train_pool_batches = max(args.token_pool_batches, args.warmup_steps + 1)
     shift_start_batch = int(train_pool_batches * args.shift_start_frac)
+    tokens_per_step = args.batch_size * args.seq_len
+    target_token_steps = 0
+    if args.target_train_tokens is not None:
+        target_token_steps = math.ceil(args.target_train_tokens / float(tokens_per_step))
+        if args.max_steps is not None and args.max_steps < target_token_steps:
+            raise ValueError(
+                "--max-steps is smaller than steps required by --target-train-tokens. "
+                "Increase --max-steps or lower --target-train-tokens."
+            )
 
     rng = jax.random.PRNGKey(args.seed)
     k_student, k_teacher, k_train, k_eval = jax.random.split(rng, 4)
@@ -1135,7 +1146,7 @@ def run(args: argparse.Namespace) -> None:
             jax.block_until_ready(update_norm)
 
         target_seconds = args.target_runtime_minutes * 60.0
-        min_steps = args.steps
+        min_steps = max(args.steps, target_token_steps)
         max_steps = args.max_steps
         run_t0 = time.perf_counter()
 
@@ -1150,6 +1161,7 @@ def run(args: argparse.Namespace) -> None:
         update_norm_total = 0.0
         hb_last: Dict[str, float] = {}
         step_count = 0
+        tokens_processed = 0
 
         while True:
             step = step_count
@@ -1232,11 +1244,15 @@ def run(args: argparse.Namespace) -> None:
             update_norm_total += update_norm_scalar
             hb_last = hb_metrics
             step_count += 1
+            tokens_processed += tokens_per_step
 
             elapsed = time.perf_counter() - run_t0
             reached_min_steps = step_count >= min_steps
             reached_target_runtime = elapsed >= target_seconds if target_seconds > 0 else True
             reached_max_steps = (max_steps is not None) and (step_count >= max_steps)
+            reached_token_target = (
+                (args.target_train_tokens is None) or (tokens_processed >= args.target_train_tokens)
+            )
 
             should_log = False
             if args.log_interval > 0 and (step_count % args.log_interval == 0):
@@ -1255,7 +1271,16 @@ def run(args: argparse.Namespace) -> None:
                 eta_by_runtime_min = (
                     max(target_seconds - elapsed, 0.0) / 60.0 if target_seconds > 0 else 0.0
                 )
-                eta_min = max(eta_by_steps_min, eta_by_runtime_min)
+                eta_by_tokens_min = (
+                    (
+                        max(args.target_train_tokens - tokens_processed, 0)
+                        / max(avg_toks_per_s, 1e-9)
+                    )
+                    / 60.0
+                    if args.target_train_tokens is not None
+                    else 0.0
+                )
+                eta_min = max(eta_by_steps_min, eta_by_runtime_min, eta_by_tokens_min)
                 progress_parts = [
                     f"[{cfg.name}]",
                     f"step={step_count}",
@@ -1269,6 +1294,10 @@ def run(args: argparse.Namespace) -> None:
                     f"grad_norm={_fmt_metric(grad_norm_scalar, 6)}",
                     f"update_norm={_fmt_metric(update_norm_scalar, 6)}",
                 ]
+                if args.target_train_tokens is not None:
+                    progress_parts.append(
+                        f"tokens={tokens_processed}/{args.target_train_tokens}"
+                    )
                 if should_eval:
                     progress_parts.append(f"val_loss={_fmt_metric(eval_loss, 6)}")
                     progress_parts.append(f"val_ce={_fmt_metric(eval_ce, 6)}")
@@ -1282,13 +1311,25 @@ def run(args: argparse.Namespace) -> None:
                     progress_parts.append(f"hb_radial={_fmt_metric(radial, 6)}")
                 print(" | ".join(progress_parts))
 
-            if reached_max_steps and not reached_target_runtime:
-                print(
-                    f"WARNING: reached max_steps={max_steps} before target runtime "
-                    f"{args.target_runtime_minutes:.2f} min."
-                )
+            if reached_max_steps and (
+                (not reached_target_runtime)
+                or (not reached_token_target)
+                or (not reached_min_steps)
+            ):
+                warn_parts = [f"max_steps={max_steps} reached early:"]
+                if not reached_min_steps:
+                    warn_parts.append(f"min_steps={min_steps} not met")
+                if not reached_target_runtime:
+                    warn_parts.append(
+                        f"target_runtime_minutes={args.target_runtime_minutes:.2f} not met"
+                    )
+                if not reached_token_target and args.target_train_tokens is not None:
+                    warn_parts.append(
+                        f"target_train_tokens={args.target_train_tokens} not met"
+                    )
+                print("WARNING: " + "; ".join(warn_parts))
                 break
-            if reached_min_steps and reached_target_runtime:
+            if reached_min_steps and reached_target_runtime and reached_token_target:
                 break
             if reached_max_steps:
                 break
@@ -1317,6 +1358,10 @@ def run(args: argparse.Namespace) -> None:
                 "steps": step_count,
                 "requested_min_steps": args.steps,
                 "target_runtime_minutes": f"{args.target_runtime_minutes:.2f}",
+                "tokens_processed": tokens_processed,
+                "target_train_tokens": (
+                    int(args.target_train_tokens) if args.target_train_tokens is not None else ""
+                ),
                 "final_loss": f"{loss_last:.8f}",
                 "final_next_token_ce": f"{ce_last:.8f}",
                 "final_distill_kl": f"{kl_last:.8f}",
@@ -1373,6 +1418,8 @@ def run(args: argparse.Namespace) -> None:
             "steps",
             "requested_min_steps",
             "target_runtime_minutes",
+            "tokens_processed",
+            "target_train_tokens",
             "final_loss",
             "final_next_token_ce",
             "final_distill_kl",
@@ -1395,6 +1442,9 @@ def run(args: argparse.Namespace) -> None:
         "max_steps": args.max_steps,
         "target_runtime_minutes": args.target_runtime_minutes,
         "token_pool_batches": train_pool_batches,
+        "tokens_per_step": tokens_per_step,
+        "target_train_tokens": args.target_train_tokens,
+        "target_token_steps": target_token_steps,
         "configs": [c.name for c in configs],
         "warmup_steps": args.warmup_steps,
         "lr": args.lr,
@@ -1446,6 +1496,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=40)
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--target-runtime-minutes", type=float, default=0.0)
+    p.add_argument("--target-train-tokens", type=int, default=None)
     p.add_argument("--warmup-steps", type=int, default=6)
     p.add_argument("--token-pool-batches", type=int, default=256)
     p.add_argument(
