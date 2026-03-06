@@ -48,6 +48,9 @@ python scripts/run_benchmarks.py \
   --dataset-config sample-10BT \
   --dataset-train-split train \
   --dataset-eval-split train \
+  --dataset-http-cache-dir artifacts/datasets/hf_http_cache \
+  --dataset-http-cache-read \
+  --dataset-http-cache-write \
   --lr 6e-4 \
   --lr-schedule warmup_cosine \
   --lr-warmup-steps 500 \
@@ -59,6 +62,8 @@ send `Authorization: Bearer ...` to dataset-server.
 If rate-limited, increase `--dataset-http-max-retries` and
 `--dataset-http-min-interval-sec`.
 Use `--log-interval` (for example `10`) to print rich live progress lines.
+For `hf_stream` mode, set `HF_HOME` / `HF_DATASETS_CACHE` to a persistent path
+to reuse downloaded shards across reruns.
 
 If a dataset is unavailable in your environment, switch to another public stream
 (for example `--dataset-name cerebras/SlimPajama-627B`) or log in with

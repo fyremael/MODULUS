@@ -4,6 +4,7 @@ import argparse
 import csv
 import dataclasses
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -100,6 +101,9 @@ class DatasetConfig:
     http_max_retries: int
     http_min_interval_sec: float
     http_token_env: str
+    http_cache_dir: Optional[str]
+    http_cache_read: bool
+    http_cache_write: bool
 
 
 def _layer_norm(x: jnp.ndarray, scale: jnp.ndarray, eps: float = 1e-5) -> jnp.ndarray:
@@ -825,7 +829,14 @@ def _make_hf_http_text_iterator(
     max_retries: int,
     min_interval_sec: float,
     token_env: str,
+    cache_dir: Optional[str],
+    cache_read: bool,
+    cache_write: bool,
 ) -> Iterator[str]:
+    def cache_path_for_url(root: Path, url: str) -> Path:
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        return root / f"{digest}.json"
+
     offset = 0
     page_len = min(max(rows_page_size, 1), 100)
     if rows_page_size != page_len:
@@ -839,6 +850,14 @@ def _make_hf_http_text_iterator(
     if token:
         headers["authorization"] = f"Bearer {token}"
 
+    cache_root: Optional[Path] = None
+    if cache_dir and (cache_read or cache_write):
+        cache_root = Path(cache_dir)
+        cache_root.mkdir(parents=True, exist_ok=True)
+
+    cache_hits = 0
+    cache_misses = 0
+
     while True:
         query = {
             "dataset": dataset_name,
@@ -851,44 +870,72 @@ def _make_hf_http_text_iterator(
         url = f"{endpoint}?{urllib.parse.urlencode(query)}"
 
         payload: Dict[str, Any] | None = None
+        loaded_from_cache = False
         last_error: Optional[BaseException] = None
-        for attempt in range(max_retries + 1):
+        cache_path: Optional[Path] = None
+        if cache_root is not None:
+            cache_path = cache_path_for_url(cache_root, url)
+
+        if cache_path is not None and cache_read and cache_path.exists():
             try:
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
-                break
-            except urllib.error.HTTPError as exc:
-                last_error = exc
-                if exc.code == 429 and attempt < max_retries:
-                    retry_after = exc.headers.get("Retry-After") if exc.headers else None
-                    if retry_after is not None:
-                        try:
-                            sleep_s = max(float(retry_after), min_interval_sec)
-                        except ValueError:
-                            sleep_s = min_interval_sec
-                    else:
-                        sleep_s = max(min_interval_sec, 2.0 * (attempt + 1))
-                    sleep_s += random.uniform(0.0, 0.5)
-                    print(
-                        f"HTTP 429 from datasets-server; backing off {sleep_s:.2f}s "
-                        f"(attempt {attempt + 1}/{max_retries})."
-                    )
-                    time.sleep(sleep_s)
-                    continue
-                if attempt >= max_retries:
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                loaded_from_cache = True
+                cache_hits += 1
+            except Exception:
+                payload = None
+
+        if payload is None:
+            cache_misses += 1
+            for attempt in range(max_retries + 1):
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        payload = json.loads(resp.read().decode("utf-8"))
                     break
-                time.sleep(max(min_interval_sec, 1.0 + attempt))
-            except Exception as exc:
-                last_error = exc
-                if attempt >= max_retries:
-                    break
-                time.sleep(max(min_interval_sec, 1.5 * (attempt + 1)))
+                except urllib.error.HTTPError as exc:
+                    last_error = exc
+                    if exc.code == 429 and attempt < max_retries:
+                        retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                        if retry_after is not None:
+                            try:
+                                sleep_s = max(float(retry_after), min_interval_sec)
+                            except ValueError:
+                                sleep_s = min_interval_sec
+                        else:
+                            sleep_s = max(min_interval_sec, 2.0 * (attempt + 1))
+                        sleep_s += random.uniform(0.0, 0.5)
+                        print(
+                            f"HTTP 429 from datasets-server; backing off {sleep_s:.2f}s "
+                            f"(attempt {attempt + 1}/{max_retries})."
+                        )
+                        time.sleep(sleep_s)
+                        continue
+                    if attempt >= max_retries:
+                        break
+                    time.sleep(max(min_interval_sec, 1.0 + attempt))
+                except Exception as exc:
+                    last_error = exc
+                    if attempt >= max_retries:
+                        break
+                    time.sleep(max(min_interval_sec, 1.5 * (attempt + 1)))
 
         if payload is None:
             raise RuntimeError(
                 f"Failed to fetch dataset rows from {url}. Last error: {last_error}"
             )
+
+        if (
+            cache_path is not None
+            and cache_write
+            and not loaded_from_cache
+            and isinstance(payload, Mapping)
+        ):
+            try:
+                tmp_path = cache_path.with_suffix(".tmp")
+                tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+                tmp_path.replace(cache_path)
+            except Exception:
+                pass
 
         rows = payload.get("rows", [])
         if not isinstance(rows, list) or len(rows) == 0:
@@ -903,8 +950,15 @@ def _make_hf_http_text_iterator(
                         yield text
 
         offset += len(rows)
-        if min_interval_sec > 0:
+        if min_interval_sec > 0 and not loaded_from_cache:
             time.sleep(min_interval_sec)
+
+        total_pages = cache_hits + cache_misses
+        if total_pages > 0 and total_pages % 100 == 0:
+            print(
+                f"hf_http cache stats: pages={total_pages}, "
+                f"hits={cache_hits}, misses={cache_misses}"
+            )
 
 
 def _make_hf_http_batches(
@@ -928,6 +982,9 @@ def _make_hf_http_batches(
         max_retries=ds_cfg.http_max_retries,
         min_interval_sec=ds_cfg.http_min_interval_sec,
         token_env=ds_cfg.http_token_env,
+        cache_dir=ds_cfg.http_cache_dir,
+        cache_read=ds_cfg.http_cache_read,
+        cache_write=ds_cfg.http_cache_write,
     )
     flat, docs_seen = _collect_stream_token_ids(
         text_iter,
@@ -972,6 +1029,13 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--lr-total-steps must be >= 1 when provided")
     if args.dataset_http_min_interval_sec < 0:
         raise ValueError("--dataset-http-min-interval-sec must be >= 0")
+    if (
+        (args.dataset_http_cache_read or args.dataset_http_cache_write)
+        and not args.dataset_http_cache_dir
+    ):
+        raise ValueError(
+            "--dataset-http-cache-dir is required when cache read/write is enabled"
+        )
     if args.max_steps is not None and args.max_steps < args.steps:
         raise ValueError("--max-steps must be >= --steps")
     if args.target_train_tokens is not None and args.target_train_tokens < 1:
@@ -1023,6 +1087,9 @@ def run(args: argparse.Namespace) -> None:
         http_max_retries=args.dataset_http_max_retries,
         http_min_interval_sec=args.dataset_http_min_interval_sec,
         http_token_env=args.dataset_http_token_env,
+        http_cache_dir=args.dataset_http_cache_dir,
+        http_cache_read=args.dataset_http_cache_read,
+        http_cache_write=args.dataset_http_cache_write,
     )
     mask = _causal_mask(args.seq_len)
 
@@ -1096,6 +1163,10 @@ def run(args: argparse.Namespace) -> None:
             print(
                 f"hf_http auth env {ds_cfg.http_token_env!r}: "
                 f"{'set' if token_present else 'not set'}"
+            )
+            print(
+                f"hf_http cache dir={ds_cfg.http_cache_dir!r}, "
+                f"read={ds_cfg.http_cache_read}, write={ds_cfg.http_cache_write}"
             )
         if args.data_source == "hf_stream":
             train_tokens = _make_hf_stream_batches(
@@ -1618,6 +1689,21 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dataset-http-max-retries", type=int, default=10)
     p.add_argument("--dataset-http-min-interval-sec", type=float, default=0.35)
     p.add_argument("--dataset-http-token-env", type=str, default="HF_TOKEN")
+    p.add_argument(
+        "--dataset-http-cache-dir",
+        type=str,
+        default="artifacts/datasets/hf_http_cache",
+    )
+    p.add_argument(
+        "--dataset-http-cache-read",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    p.add_argument(
+        "--dataset-http-cache-write",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument(
         "--lr-schedule",
