@@ -44,10 +44,10 @@ Run benchmark on a real-world streamed corpus (SlimPajama / MiniPile-style):
 ```bash
 python scripts/run_benchmarks.py \
   --data-source hf_http \
-  --dataset-name JeanKaddour/minipile \
-  --dataset-config default \
+  --dataset-name HuggingFaceFW/fineweb \
+  --dataset-config sample-10BT \
   --dataset-train-split train \
-  --dataset-eval-split validation
+  --dataset-eval-split train
 ```
 Note: for `hf_http`, keep `--dataset-rows-page-size` at `<=100` (HF API limit).
 For higher request budgets, set `HF_TOKEN` in the environment and the runner will
