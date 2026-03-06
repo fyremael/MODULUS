@@ -562,6 +562,11 @@ def _make_token_batches(
 _WORD_RE = re.compile(r"\w+|[^\w\s]", flags=re.UNICODE)
 
 
+def _is_numpy_umath_center_error(exc: BaseException) -> bool:
+    s = str(exc)
+    return "_center" in s and "numpy._core.umath" in s
+
+
 def _stable_token_id(token: str, vocab_size: int) -> int:
     if vocab_size <= 3:
         return 0
@@ -606,6 +611,12 @@ def _make_hf_text_iterator(
     try:
         from datasets import load_dataset  # type: ignore
     except Exception as exc:
+        if _is_numpy_umath_center_error(exc):
+            raise RuntimeError(
+                "Detected inconsistent NumPy installation in this Colab runtime. "
+                "Run: `%pip install -U --force-reinstall --no-cache-dir \"numpy>=1.26,<2.3\"` "
+                "then restart runtime and rerun setup."
+            ) from exc
         raise RuntimeError(
             "Hugging Face datasets is required for --data-source=hf_stream. "
             "Install with: python -m pip install datasets"
@@ -628,11 +639,23 @@ def _make_hf_text_iterator(
         try:
             dataset = load_dataset(**load_kwargs)
         except Exception as exc:
+            if _is_numpy_umath_center_error(exc):
+                raise RuntimeError(
+                    "Detected inconsistent NumPy installation in this Colab runtime. "
+                    "Run: `%pip install -U --force-reinstall --no-cache-dir \"numpy>=1.26,<2.3\"` "
+                    "then restart runtime and rerun setup."
+                ) from exc
             raise RuntimeError(
                 "Failed to load dataset after retry without trust_remote_code. "
                 "Try --dataset-name JeanKaddour/minipile to validate streaming path first."
             ) from exc
     except Exception as exc:
+        if _is_numpy_umath_center_error(exc):
+            raise RuntimeError(
+                "Detected inconsistent NumPy installation in this Colab runtime. "
+                "Run: `%pip install -U --force-reinstall --no-cache-dir \"numpy>=1.26,<2.3\"` "
+                "then restart runtime and rerun setup."
+            ) from exc
         msg = str(exc)
         hint = (
             "Failed to load dataset in hf_stream mode. "
@@ -667,14 +690,23 @@ def _collect_stream_token_ids(
     docs_seen = 0
 
     for text in text_iter:
-        docs_seen += 1
-        flat_tokens.extend(
-            _text_to_ids(
-                text,
-                vocab_size=vocab_size,
-                max_doc_tokens=max_doc_tokens,
+        try:
+            docs_seen += 1
+            flat_tokens.extend(
+                _text_to_ids(
+                    text,
+                    vocab_size=vocab_size,
+                    max_doc_tokens=max_doc_tokens,
+                )
             )
-        )
+        except ImportError as exc:
+            if _is_numpy_umath_center_error(exc):
+                raise RuntimeError(
+                    "Detected inconsistent NumPy installation while streaming dataset. "
+                    "Run: `%pip install -U --force-reinstall --no-cache-dir \"numpy>=1.26,<2.3\"` "
+                    "then restart runtime and rerun setup."
+                ) from exc
+            raise
 
         if len(flat_tokens) >= required_tokens:
             break
