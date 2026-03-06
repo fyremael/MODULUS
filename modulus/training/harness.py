@@ -17,7 +17,7 @@ We prefer explicitness over magic: everything is functional and auditable.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -131,3 +131,76 @@ def make_train_step(
         return new_state, metrics
 
     return jax.jit(step_fn)
+
+
+def make_eval_step(
+    *,
+    apply_fn: Callable[[PyTree, jnp.ndarray], jnp.ndarray],
+    loss_fn: Callable[[Callable, PyTree, Any], Tuple[jnp.ndarray, Any]] = default_loss_and_logits,
+) -> Callable[[Any, Any], Dict[str, jnp.ndarray]]:
+    """
+    Build a JIT-able eval_step(state, batch) -> metrics.
+
+    This mirrors make_train_step but does not update parameters.
+    """
+
+    def eval_fn(state, batch):
+        loss, _ = loss_fn(apply_fn, state.params, batch)
+        return {"loss": loss}
+
+    return jax.jit(eval_fn)
+
+
+def run_train_loop(
+    *,
+    state: Any,
+    train_step_fn: Callable[[Any, Any], Tuple[Any, Dict[str, jnp.ndarray]]],
+    train_batches: Iterable[Any],
+    num_steps: int,
+    eval_step_fn: Optional[Callable[[Any, Any], Dict[str, jnp.ndarray]]] = None,
+    eval_batches: Optional[Iterable[Any]] = None,
+    eval_interval: int = 0,
+) -> Tuple[Any, List[Dict[str, float]]]:
+    """
+    Run a simple Python training loop with optional periodic validation metrics.
+
+    Returns:
+      (final_state, history)
+      where history is a list of per-step scalar metric dicts.
+    """
+    if num_steps < 1:
+        raise ValueError("num_steps must be >= 1")
+    if eval_interval < 0:
+        raise ValueError("eval_interval must be >= 0")
+
+    train_it = iter(train_batches)
+    eval_list = list(eval_batches) if eval_batches is not None else []
+    history: List[Dict[str, float]] = []
+
+    for step_idx in range(num_steps):
+        batch = next(train_it)
+        state, train_metrics = train_step_fn(state, batch)
+        step_metrics: Dict[str, float] = {
+            f"train/{k}": float(jnp.asarray(v)) for k, v in train_metrics.items()
+        }
+        step_metrics["step"] = float(step_idx + 1)
+
+        should_eval = (
+            eval_step_fn is not None
+            and len(eval_list) > 0
+            and eval_interval > 0
+            and (((step_idx + 1) % eval_interval == 0) or (step_idx == num_steps - 1))
+        )
+        if should_eval:
+            eval_acc: Dict[str, float] = {}
+            for b in eval_list:
+                mets = eval_step_fn(state, b)
+                for k, v in mets.items():
+                    eval_acc[k] = eval_acc.get(k, 0.0) + float(jnp.asarray(v))
+            n = float(len(eval_list))
+            for k, total in eval_acc.items():
+                step_metrics[f"val/{k}"] = total / n
+
+        history.append(step_metrics)
+
+    return state, history
