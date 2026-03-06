@@ -31,6 +31,26 @@ class BenchmarkConfig:
     lora_hook_on: bool
 
 
+def _available_benchmark_configs() -> Dict[str, BenchmarkConfig]:
+    return {
+        "baseline": BenchmarkConfig(
+            "baseline", hyperball_on=False, grouped=False, lora_hook_on=False
+        ),
+        "lora_hook_only": BenchmarkConfig(
+            "lora_hook_only", hyperball_on=False, grouped=False, lora_hook_on=True
+        ),
+        "hyperball_ungrouped": BenchmarkConfig(
+            "hyperball_ungrouped", hyperball_on=True, grouped=False, lora_hook_on=False
+        ),
+        "hyperball_grouped": BenchmarkConfig(
+            "hyperball_grouped", hyperball_on=True, grouped=True, lora_hook_on=False
+        ),
+        "hyperball_grouped_lora": BenchmarkConfig(
+            "hyperball_grouped_lora", hyperball_on=True, grouped=True, lora_hook_on=True
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     width: int
@@ -720,6 +740,16 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--seq-len must be >= 2 for next-token objective")
     if args.vocab_size < 16:
         raise ValueError("--vocab-size must be >= 16")
+    if args.eval_batches < 1:
+        raise ValueError("--eval-batches must be >= 1")
+    if args.steps < 1:
+        raise ValueError("--steps must be >= 1")
+    if args.token_pool_batches < 1:
+        raise ValueError("--token-pool-batches must be >= 1")
+    if args.target_runtime_minutes < 0:
+        raise ValueError("--target-runtime-minutes must be >= 0")
+    if args.max_steps is not None and args.max_steps < args.steps:
+        raise ValueError("--max-steps must be >= --steps")
     if not (0.0 <= args.distill_weight <= 1.0):
         raise ValueError("--distill-weight must be in [0, 1]")
     if not (0.0 <= args.label_smoothing < 1.0):
@@ -765,20 +795,21 @@ def run(args: argparse.Namespace) -> None:
     )
     mask = _causal_mask(args.seq_len)
 
-    configs = [
-        BenchmarkConfig("baseline", hyperball_on=False, grouped=False, lora_hook_on=False),
-        BenchmarkConfig("lora_hook_only", hyperball_on=False, grouped=False, lora_hook_on=True),
-        BenchmarkConfig(
-            "hyperball_ungrouped", hyperball_on=True, grouped=False, lora_hook_on=False
-        ),
-        BenchmarkConfig("hyperball_grouped", hyperball_on=True, grouped=True, lora_hook_on=False),
-        BenchmarkConfig(
-            "hyperball_grouped_lora", hyperball_on=True, grouped=True, lora_hook_on=True
-        ),
-    ]
+    all_configs = _available_benchmark_configs()
+    requested_cfgs = [c.strip() for c in args.configs.split(",") if c.strip()]
+    if not requested_cfgs or requested_cfgs == ["all"]:
+        configs = list(all_configs.values())
+    else:
+        unknown = [c for c in requested_cfgs if c not in all_configs]
+        if unknown:
+            raise ValueError(
+                f"Unknown --configs value(s): {unknown}. "
+                f"Valid: {sorted(all_configs.keys())} or 'all'."
+            )
+        configs = [all_configs[c] for c in requested_cfgs]
 
-    total_batches = args.steps + args.warmup_steps
-    shift_start_batch = int(total_batches * args.shift_start_frac)
+    train_pool_batches = max(args.token_pool_batches, args.warmup_steps + 1)
+    shift_start_batch = int(train_pool_batches * args.shift_start_frac)
 
     rng = jax.random.PRNGKey(args.seed)
     k_student, k_teacher, k_train, k_eval = jax.random.split(rng, 4)
@@ -787,7 +818,7 @@ def run(args: argparse.Namespace) -> None:
     if args.data_source == "synthetic":
         train_tokens = _make_token_batches(
             k_train,
-            num_batches=total_batches,
+            num_batches=train_pool_batches,
             batch_size=args.batch_size,
             seq_len=args.seq_len,
             vocab_size=args.vocab_size,
@@ -812,7 +843,7 @@ def run(args: argparse.Namespace) -> None:
             ds_cfg,
             split=ds_cfg.train_split,
             seed=args.seed + 11,
-            num_batches=total_batches,
+            num_batches=train_pool_batches,
             batch_size=args.batch_size,
             seq_len=args.seq_len,
             vocab_size=args.vocab_size,
@@ -888,6 +919,11 @@ def run(args: argparse.Namespace) -> None:
             jax.block_until_ready(grad_norm)
             jax.block_until_ready(update_norm)
 
+        target_seconds = args.target_runtime_minutes * 60.0
+        min_steps = args.steps
+        max_steps = args.max_steps
+        run_t0 = time.perf_counter()
+
         loss_last = float("nan")
         ce_last = float("nan")
         kl_last = float("nan")
@@ -898,9 +934,12 @@ def run(args: argparse.Namespace) -> None:
         grad_norm_total = 0.0
         update_norm_total = 0.0
         hb_last: Dict[str, float] = {}
+        step_count = 0
 
-        for step in range(args.steps):
-            tokens = train_tokens[args.warmup_steps + step]
+        while True:
+            step = step_count
+            token_idx = (args.warmup_steps + step) % train_pool_batches
+            tokens = train_tokens[token_idx]
             t0 = time.perf_counter()
             params, opt_state, loss_val, ce_val, kl_val, grad_norm, update_norm = step_fn(
                 params, opt_state, tokens
@@ -977,6 +1016,37 @@ def run(args: argparse.Namespace) -> None:
             grad_norm_total += grad_norm_scalar
             update_norm_total += update_norm_scalar
             hb_last = hb_metrics
+            step_count += 1
+
+            elapsed = time.perf_counter() - run_t0
+            reached_min_steps = step_count >= min_steps
+            reached_target_runtime = elapsed >= target_seconds if target_seconds > 0 else True
+            reached_max_steps = (max_steps is not None) and (step_count >= max_steps)
+            if reached_max_steps and not reached_target_runtime:
+                print(
+                    f"WARNING: reached max_steps={max_steps} before target runtime "
+                    f"{args.target_runtime_minutes:.2f} min."
+                )
+                break
+            if reached_min_steps and reached_target_runtime:
+                break
+            if reached_max_steps:
+                break
+
+        # Always produce a terminal eval snapshot for summary-level comparison.
+        eval_loss_acc = 0.0
+        eval_ce_acc = 0.0
+        eval_kl_acc = 0.0
+        for eval_idx in range(args.eval_batches):
+            loss_eval, ce_eval, kl_eval = eval_fn(params, eval_tokens[eval_idx])
+            loss_eval = float(jax.block_until_ready(loss_eval))
+            ce_eval = float(jax.block_until_ready(ce_eval))
+            kl_eval = float(jax.block_until_ready(kl_eval))
+            eval_loss_acc += loss_eval
+            eval_ce_acc += ce_eval
+            eval_kl_acc += kl_eval
+        final_eval_loss = eval_loss_acc / float(args.eval_batches)
+        best_eval_loss = min(best_eval_loss, final_eval_loss)
 
         summary_rows.append(
             {
@@ -984,16 +1054,18 @@ def run(args: argparse.Namespace) -> None:
                 "hyperball_on": int(cfg.hyperball_on),
                 "grouped": int(cfg.grouped),
                 "lora_hook_on": int(cfg.lora_hook_on),
-                "steps": args.steps,
+                "steps": step_count,
+                "requested_min_steps": args.steps,
+                "target_runtime_minutes": f"{args.target_runtime_minutes:.2f}",
                 "final_loss": f"{loss_last:.8f}",
                 "final_next_token_ce": f"{ce_last:.8f}",
                 "final_distill_kl": f"{kl_last:.8f}",
                 "final_eval_loss": f"{final_eval_loss:.8f}",
                 "best_eval_loss": f"{best_eval_loss:.8f}",
-                "avg_step_ms": f"{(step_ms_total / max(args.steps, 1)):.4f}",
-                "avg_tokens_per_s": f"{(tokens_per_s_total / max(args.steps, 1)):.2f}",
-                "avg_grad_norm": f"{(grad_norm_total / max(args.steps, 1)):.8f}",
-                "avg_update_norm": f"{(update_norm_total / max(args.steps, 1)):.8f}",
+                "avg_step_ms": f"{(step_ms_total / max(step_count, 1)):.4f}",
+                "avg_tokens_per_s": f"{(tokens_per_s_total / max(step_count, 1)):.2f}",
+                "avg_grad_norm": f"{(grad_norm_total / max(step_count, 1)):.8f}",
+                "avg_update_norm": f"{(update_norm_total / max(step_count, 1)):.8f}",
                 "final_hyperball_angle_mean": (
                     f"{hb_last.get('hyperball/angle_mean', float('nan')):.8f}"
                 ),
@@ -1039,6 +1111,8 @@ def run(args: argparse.Namespace) -> None:
             "grouped",
             "lora_hook_on",
             "steps",
+            "requested_min_steps",
+            "target_runtime_minutes",
             "final_loss",
             "final_next_token_ce",
             "final_distill_kl",
@@ -1058,6 +1132,10 @@ def run(args: argparse.Namespace) -> None:
         "seed": args.seed,
         "batch_size": args.batch_size,
         "steps": args.steps,
+        "max_steps": args.max_steps,
+        "target_runtime_minutes": args.target_runtime_minutes,
+        "token_pool_batches": train_pool_batches,
+        "configs": [c.name for c in configs],
         "warmup_steps": args.warmup_steps,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
@@ -1105,7 +1183,16 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         )
     )
     p.add_argument("--steps", type=int, default=40)
+    p.add_argument("--max-steps", type=int, default=None)
+    p.add_argument("--target-runtime-minutes", type=float, default=0.0)
     p.add_argument("--warmup-steps", type=int, default=6)
+    p.add_argument("--token-pool-batches", type=int, default=256)
+    p.add_argument(
+        "--configs",
+        type=str,
+        default="all",
+        help="Comma-separated config names or 'all'.",
+    )
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--seq-len", type=int, default=128)
     p.add_argument("--width", type=int, default=256)
