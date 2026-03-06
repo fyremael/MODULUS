@@ -8,6 +8,8 @@ import json
 import math
 import re
 import time
+import urllib.parse
+import urllib.request
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,6 +92,9 @@ class DatasetConfig:
     train_max_docs: Optional[int]
     eval_max_docs: Optional[int]
     trust_remote_code: bool
+    rows_endpoint: str
+    rows_page_size: int
+    http_max_retries: int
 
 
 def _layer_norm(x: jnp.ndarray, scale: jnp.ndarray, eps: float = 1e-5) -> jnp.ndarray:
@@ -763,6 +768,98 @@ def _make_hf_stream_batches(
     return flat.reshape((num_batches, batch_size, seq_len))
 
 
+def _make_hf_http_text_iterator(
+    *,
+    dataset_name: str,
+    dataset_config: Optional[str],
+    split: str,
+    text_keys: Sequence[str],
+    rows_endpoint: str,
+    rows_page_size: int,
+    max_retries: int,
+) -> Iterator[str]:
+    offset = 0
+    endpoint = rows_endpoint.rstrip("/")
+
+    while True:
+        query = {
+            "dataset": dataset_name,
+            "split": split,
+            "offset": offset,
+            "length": rows_page_size,
+        }
+        if dataset_config:
+            query["config"] = dataset_config
+        url = f"{endpoint}?{urllib.parse.urlencode(query)}"
+
+        payload: Dict[str, Any] | None = None
+        last_error: Optional[BaseException] = None
+        for attempt in range(max_retries + 1):
+            try:
+                req = urllib.request.Request(url, headers={"accept": "application/json"})
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt >= max_retries:
+                    break
+                time.sleep(1.5 * (attempt + 1))
+
+        if payload is None:
+            raise RuntimeError(
+                f"Failed to fetch dataset rows from {url}. Last error: {last_error}"
+            )
+
+        rows = payload.get("rows", [])
+        if not isinstance(rows, list) or len(rows) == 0:
+            break
+
+        for row in rows:
+            if isinstance(row, Mapping):
+                example = row.get("row", row)
+                if isinstance(example, Mapping):
+                    text = _extract_text(example, text_keys)
+                    if text is not None:
+                        yield text
+
+        offset += len(rows)
+
+
+def _make_hf_http_batches(
+    ds_cfg: DatasetConfig,
+    *,
+    split: str,
+    num_batches: int,
+    batch_size: int,
+    seq_len: int,
+    vocab_size: int,
+    max_docs: Optional[int],
+) -> jnp.ndarray:
+    required_tokens = num_batches * batch_size * seq_len
+    text_iter = _make_hf_http_text_iterator(
+        dataset_name=ds_cfg.name,
+        dataset_config=ds_cfg.config,
+        split=split,
+        text_keys=ds_cfg.text_keys,
+        rows_endpoint=ds_cfg.rows_endpoint,
+        rows_page_size=ds_cfg.rows_page_size,
+        max_retries=ds_cfg.http_max_retries,
+    )
+    flat, docs_seen = _collect_stream_token_ids(
+        text_iter,
+        required_tokens=required_tokens,
+        vocab_size=vocab_size,
+        max_doc_tokens=ds_cfg.max_doc_tokens,
+        max_docs=max_docs,
+        progress_label=f"hf_http[{split}]",
+    )
+    print(
+        f"hf_http[{split}]: collected {required_tokens} tokens from {docs_seen} documents."
+    )
+    return flat.reshape((num_batches, batch_size, seq_len))
+
+
 def run(args: argparse.Namespace) -> None:
     if args.width % args.num_heads != 0:
         raise ValueError("--width must be divisible by --num-heads")
@@ -788,10 +885,10 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--label-smoothing must be in [0, 1)")
     if not (0.0 <= args.shift_start_frac <= 1.0):
         raise ValueError("--shift-start-frac must be in [0, 1]")
-    if args.data_source not in {"synthetic", "hf_stream"}:
-        raise ValueError("--data-source must be one of: synthetic, hf_stream")
-    if args.data_source == "hf_stream" and not args.dataset_name:
-        raise ValueError("--dataset-name is required when --data-source=hf_stream")
+    if args.data_source not in {"synthetic", "hf_stream", "hf_http"}:
+        raise ValueError("--data-source must be one of: synthetic, hf_stream, hf_http")
+    if args.data_source in {"hf_stream", "hf_http"} and not args.dataset_name:
+        raise ValueError("--dataset-name is required when --data-source is hf_stream or hf_http")
 
     root = Path(__file__).resolve().parents[1]
     out_root = root / "artifacts" / "benchmarks"
@@ -824,6 +921,9 @@ def run(args: argparse.Namespace) -> None:
         train_max_docs=args.dataset_train_max_docs,
         eval_max_docs=args.dataset_eval_max_docs,
         trust_remote_code=args.dataset_trust_remote_code,
+        rows_endpoint=args.dataset_rows_endpoint,
+        rows_page_size=args.dataset_rows_page_size,
+        http_max_retries=args.dataset_http_max_retries,
     )
     mask = _causal_mask(args.seq_len)
 
@@ -871,43 +971,62 @@ def run(args: argparse.Namespace) -> None:
             "Using real-world text stream dataset: "
             f"{ds_cfg.name} [{ds_cfg.config or 'default'}]"
         )
-        train_tokens = _make_hf_stream_batches(
-            ds_cfg,
-            split=ds_cfg.train_split,
-            seed=args.seed + 11,
-            num_batches=train_pool_batches,
-            batch_size=args.batch_size,
-            seq_len=args.seq_len,
-            vocab_size=args.vocab_size,
-            max_docs=ds_cfg.train_max_docs,
-        )
-        try:
-            eval_tokens = _make_hf_stream_batches(
+        if args.data_source == "hf_stream":
+            train_tokens = _make_hf_stream_batches(
                 ds_cfg,
-                split=ds_cfg.eval_split,
-                seed=args.seed + 29,
-                num_batches=args.eval_batches,
+                split=ds_cfg.train_split,
+                seed=args.seed + 11,
+                num_batches=train_pool_batches,
                 batch_size=args.batch_size,
                 seq_len=args.seq_len,
                 vocab_size=args.vocab_size,
-                max_docs=ds_cfg.eval_max_docs,
+                max_docs=ds_cfg.train_max_docs,
             )
-        except Exception as exc:
-            if args.dataset_eval_fallback_to_train and ds_cfg.eval_split != ds_cfg.train_split:
-                print(
-                    f"Eval split '{ds_cfg.eval_split}' failed ({exc}). "
-                    f"Falling back to train split '{ds_cfg.train_split}'."
-                )
-                eval_tokens = _make_hf_stream_batches(
+
+            def build_eval(split_name: str, seed_val: int):
+                return _make_hf_stream_batches(
                     ds_cfg,
-                    split=ds_cfg.train_split,
-                    seed=args.seed + 47,
+                    split=split_name,
+                    seed=seed_val,
                     num_batches=args.eval_batches,
                     batch_size=args.batch_size,
                     seq_len=args.seq_len,
                     vocab_size=args.vocab_size,
                     max_docs=ds_cfg.eval_max_docs,
                 )
+
+        else:
+            train_tokens = _make_hf_http_batches(
+                ds_cfg,
+                split=ds_cfg.train_split,
+                num_batches=train_pool_batches,
+                batch_size=args.batch_size,
+                seq_len=args.seq_len,
+                vocab_size=args.vocab_size,
+                max_docs=ds_cfg.train_max_docs,
+            )
+
+            def build_eval(split_name: str, seed_val: int):
+                del seed_val
+                return _make_hf_http_batches(
+                    ds_cfg,
+                    split=split_name,
+                    num_batches=args.eval_batches,
+                    batch_size=args.batch_size,
+                    seq_len=args.seq_len,
+                    vocab_size=args.vocab_size,
+                    max_docs=ds_cfg.eval_max_docs,
+                )
+
+        try:
+            eval_tokens = build_eval(ds_cfg.eval_split, args.seed + 29)
+        except Exception as exc:
+            if args.dataset_eval_fallback_to_train and ds_cfg.eval_split != ds_cfg.train_split:
+                print(
+                    f"Eval split '{ds_cfg.eval_split}' failed ({exc}). "
+                    f"Falling back to train split '{ds_cfg.train_split}'."
+                )
+                eval_tokens = build_eval(ds_cfg.train_split, args.seed + 47)
             else:
                 raise
 
@@ -1182,7 +1301,7 @@ def run(args: argparse.Namespace) -> None:
         "distill_weight": args.distill_weight,
         "label_smoothing": args.label_smoothing,
         "data_source": args.data_source,
-        "dataset": (dataclasses.asdict(ds_cfg) if args.data_source == "hf_stream" else None),
+        "dataset": (dataclasses.asdict(ds_cfg) if args.data_source != "synthetic" else None),
         "model": dataclasses.asdict(model_cfg),
         "jax_version": jax.__version__,
         "jax_backend": jax.default_backend(),
@@ -1241,7 +1360,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--eval-rare-token-prob", type=float, default=0.08)
     p.add_argument("--data-source", type=str, default="synthetic")
     p.add_argument("--dataset-name", type=str, default="JeanKaddour/minipile")
-    p.add_argument("--dataset-config", type=str, default=None)
+    p.add_argument("--dataset-config", type=str, default="default")
     p.add_argument("--dataset-train-split", type=str, default="train")
     p.add_argument("--dataset-eval-split", type=str, default="validation")
     p.add_argument("--dataset-text-keys", type=str, default="text,content,document")
@@ -1255,6 +1374,13 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    p.add_argument(
+        "--dataset-rows-endpoint",
+        type=str,
+        default="https://datasets-server.huggingface.co/rows",
+    )
+    p.add_argument("--dataset-rows-page-size", type=int, default=200)
+    p.add_argument("--dataset-http-max-retries", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--grad-clip-norm", type=float, default=1.0)

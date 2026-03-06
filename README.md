@@ -42,10 +42,10 @@ python scripts/run_benchmarks.py
 
 Run benchmark on a real-world streamed corpus (SlimPajama / MiniPile-style):
 ```bash
-python -m pip install datasets
 python scripts/run_benchmarks.py \
-  --data-source hf_stream \
+  --data-source hf_http \
   --dataset-name JeanKaddour/minipile \
+  --dataset-config default \
   --dataset-train-split train \
   --dataset-eval-split validation
 ```
@@ -54,18 +54,12 @@ If a dataset is unavailable in your environment, switch to another public stream
 (for example `--dataset-name cerebras/SlimPajama-627B`) or log in with
 `huggingface-cli login` for gated datasets.
 
-If Colab shows NumPy import errors like `_center` from `numpy._core.umath`,
-repair the runtime with:
-```bash
-python -m pip install -U --force-reinstall --no-cache-dir "numpy==2.1.3"
-```
-Then restart the runtime.
-
 Colab TPU substantial baseline (single config, minimum wall-time budget):
 ```bash
 python scripts/run_benchmarks.py \
-  --data-source hf_stream \
+  --data-source hf_http \
   --dataset-name JeanKaddour/minipile \
+  --dataset-config default \
   --configs baseline \
   --target-runtime-minutes 30 \
   --steps 400 \
