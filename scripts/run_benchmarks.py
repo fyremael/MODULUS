@@ -779,6 +779,12 @@ def _make_hf_http_text_iterator(
     max_retries: int,
 ) -> Iterator[str]:
     offset = 0
+    page_len = min(max(rows_page_size, 1), 100)
+    if rows_page_size != page_len:
+        print(
+            f"dataset_rows_page_size={rows_page_size} adjusted to {page_len} "
+            "(datasets-server /rows max length is 100)."
+        )
     endpoint = rows_endpoint.rstrip("/")
 
     while True:
@@ -786,7 +792,7 @@ def _make_hf_http_text_iterator(
             "dataset": dataset_name,
             "split": split,
             "offset": offset,
-            "length": rows_page_size,
+            "length": page_len,
         }
         if dataset_config:
             query["config"] = dataset_config
@@ -1379,7 +1385,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         type=str,
         default="https://datasets-server.huggingface.co/rows",
     )
-    p.add_argument("--dataset-rows-page-size", type=int, default=200)
+    p.add_argument("--dataset-rows-page-size", type=int, default=100)
     p.add_argument("--dataset-http-max-retries", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-2)

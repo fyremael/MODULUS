@@ -49,6 +49,7 @@ python scripts/run_benchmarks.py \
   --dataset-train-split train \
   --dataset-eval-split validation
 ```
+Note: for `hf_http`, keep `--dataset-rows-page-size` at `<=100` (HF API limit).
 
 If a dataset is unavailable in your environment, switch to another public stream
 (for example `--dataset-name cerebras/SlimPajama-627B`) or log in with
