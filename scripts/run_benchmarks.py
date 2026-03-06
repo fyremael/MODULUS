@@ -6,10 +6,12 @@ import dataclasses
 import datetime as dt
 import json
 import math
+import re
 import time
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -53,6 +55,21 @@ class ObjectiveConfig:
     distill_temperature: float
     distill_weight: float
     label_smoothing: float
+
+
+@dataclass(frozen=True)
+class DatasetConfig:
+    source: str
+    name: str
+    config: Optional[str]
+    train_split: str
+    eval_split: str
+    text_keys: Tuple[str, ...]
+    shuffle_buffer: int
+    max_doc_tokens: int
+    train_max_docs: Optional[int]
+    eval_max_docs: Optional[int]
+    trust_remote_code: bool
 
 
 def _layer_norm(x: jnp.ndarray, scale: jnp.ndarray, eps: float = 1e-5) -> jnp.ndarray:
@@ -522,6 +539,162 @@ def _make_token_batches(
     return jnp.where(inject_mask, rare_tokens, tokens).astype(jnp.int32)
 
 
+_WORD_RE = re.compile(r"\w+|[^\w\s]", flags=re.UNICODE)
+
+
+def _stable_token_id(token: str, vocab_size: int) -> int:
+    if vocab_size <= 3:
+        return 0
+    h = zlib.crc32(token.encode("utf-8")) & 0xFFFFFFFF
+    return 3 + (h % (vocab_size - 3))
+
+
+def _text_to_ids(text: str, *, vocab_size: int, max_doc_tokens: int) -> List[int]:
+    pieces = _WORD_RE.findall(text.lower())
+    if not pieces:
+        return []
+
+    budget = max(max_doc_tokens, 2)
+    body = pieces[: max(0, budget - 2)]
+    ids = [1]
+    ids.extend(_stable_token_id(tok, vocab_size) for tok in body)
+    ids.append(2)
+    return ids
+
+
+def _extract_text(example: Mapping[str, Any], text_keys: Sequence[str]) -> Optional[str]:
+    for key in text_keys:
+        value = example.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    for value in example.values():
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _make_hf_text_iterator(
+    *,
+    dataset_name: str,
+    dataset_config: Optional[str],
+    split: str,
+    text_keys: Sequence[str],
+    shuffle_buffer: int,
+    seed: int,
+    trust_remote_code: bool,
+) -> Iterator[str]:
+    try:
+        from datasets import load_dataset  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "Hugging Face datasets is required for --data-source=hf_stream. "
+            "Install with: python -m pip install datasets"
+        ) from exc
+
+    load_kwargs: Dict[str, Any] = {
+        "path": dataset_name,
+        "split": split,
+        "streaming": True,
+    }
+    if dataset_config:
+        load_kwargs["name"] = dataset_config
+    if trust_remote_code:
+        load_kwargs["trust_remote_code"] = True
+
+    try:
+        dataset = load_dataset(**load_kwargs)
+    except TypeError:
+        load_kwargs.pop("trust_remote_code", None)
+        dataset = load_dataset(**load_kwargs)
+
+    if shuffle_buffer > 0:
+        dataset = dataset.shuffle(seed=seed, buffer_size=shuffle_buffer)
+
+    for example in dataset:
+        if not isinstance(example, Mapping):
+            continue
+        text = _extract_text(example, text_keys)
+        if text is not None:
+            yield text
+
+
+def _collect_stream_token_ids(
+    text_iter: Iterator[str],
+    *,
+    required_tokens: int,
+    vocab_size: int,
+    max_doc_tokens: int,
+    max_docs: Optional[int],
+    progress_label: str,
+) -> Tuple[jnp.ndarray, int]:
+    flat_tokens: List[int] = []
+    docs_seen = 0
+
+    for text in text_iter:
+        docs_seen += 1
+        flat_tokens.extend(
+            _text_to_ids(
+                text,
+                vocab_size=vocab_size,
+                max_doc_tokens=max_doc_tokens,
+            )
+        )
+
+        if len(flat_tokens) >= required_tokens:
+            break
+        if max_docs is not None and docs_seen >= max_docs:
+            break
+        if docs_seen % 1000 == 0:
+            print(
+                f"{progress_label}: docs={docs_seen}, "
+                f"tokens={len(flat_tokens)}/{required_tokens}"
+            )
+
+    if len(flat_tokens) < required_tokens:
+        raise RuntimeError(
+            f"{progress_label}: insufficient tokens ({len(flat_tokens)} < {required_tokens}). "
+            "Increase max docs, reduce benchmark size, or use a denser text field."
+        )
+
+    token_arr = jnp.asarray(flat_tokens[:required_tokens], dtype=jnp.int32)
+    return token_arr, docs_seen
+
+
+def _make_hf_stream_batches(
+    ds_cfg: DatasetConfig,
+    *,
+    split: str,
+    seed: int,
+    num_batches: int,
+    batch_size: int,
+    seq_len: int,
+    vocab_size: int,
+    max_docs: Optional[int],
+) -> jnp.ndarray:
+    required_tokens = num_batches * batch_size * seq_len
+    text_iter = _make_hf_text_iterator(
+        dataset_name=ds_cfg.name,
+        dataset_config=ds_cfg.config,
+        split=split,
+        text_keys=ds_cfg.text_keys,
+        shuffle_buffer=ds_cfg.shuffle_buffer,
+        seed=seed,
+        trust_remote_code=ds_cfg.trust_remote_code,
+    )
+    flat, docs_seen = _collect_stream_token_ids(
+        text_iter,
+        required_tokens=required_tokens,
+        vocab_size=vocab_size,
+        max_doc_tokens=ds_cfg.max_doc_tokens,
+        max_docs=max_docs,
+        progress_label=f"hf_stream[{split}]",
+    )
+    print(
+        f"hf_stream[{split}]: collected {required_tokens} tokens from {docs_seen} documents."
+    )
+    return flat.reshape((num_batches, batch_size, seq_len))
+
+
 def run(args: argparse.Namespace) -> None:
     if args.width % args.num_heads != 0:
         raise ValueError("--width must be divisible by --num-heads")
@@ -537,6 +710,10 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--label-smoothing must be in [0, 1)")
     if not (0.0 <= args.shift_start_frac <= 1.0):
         raise ValueError("--shift-start-frac must be in [0, 1]")
+    if args.data_source not in {"synthetic", "hf_stream"}:
+        raise ValueError("--data-source must be one of: synthetic, hf_stream")
+    if args.data_source == "hf_stream" and not args.dataset_name:
+        raise ValueError("--dataset-name is required when --data-source=hf_stream")
 
     root = Path(__file__).resolve().parents[1]
     out_root = root / "artifacts" / "benchmarks"
@@ -556,6 +733,19 @@ def run(args: argparse.Namespace) -> None:
         distill_temperature=args.distill_temperature,
         distill_weight=args.distill_weight,
         label_smoothing=args.label_smoothing,
+    )
+    ds_cfg = DatasetConfig(
+        source=args.data_source,
+        name=args.dataset_name,
+        config=args.dataset_config,
+        train_split=args.dataset_train_split,
+        eval_split=args.dataset_eval_split,
+        text_keys=tuple(k.strip() for k in args.dataset_text_keys.split(",") if k.strip()),
+        shuffle_buffer=args.dataset_shuffle_buffer,
+        max_doc_tokens=args.dataset_max_doc_tokens,
+        train_max_docs=args.dataset_train_max_docs,
+        eval_max_docs=args.dataset_eval_max_docs,
+        trust_remote_code=args.dataset_trust_remote_code,
     )
     mask = _causal_mask(args.seq_len)
 
@@ -578,24 +768,69 @@ def run(args: argparse.Namespace) -> None:
     k_student, k_teacher, k_train, k_eval = jax.random.split(rng, 4)
     init_params = _make_initial_params(k_student, model_cfg=model_cfg)
     teacher_params = _make_initial_params(k_teacher, model_cfg=model_cfg)
-    train_tokens = _make_token_batches(
-        k_train,
-        num_batches=total_batches,
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        vocab_size=args.vocab_size,
-        shift_start_batch=shift_start_batch,
-        rare_inject_prob=args.train_rare_token_prob,
-    )
-    eval_tokens = _make_token_batches(
-        k_eval,
-        num_batches=args.eval_batches,
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        vocab_size=args.vocab_size,
-        shift_start_batch=0,
-        rare_inject_prob=args.eval_rare_token_prob,
-    )
+    if args.data_source == "synthetic":
+        train_tokens = _make_token_batches(
+            k_train,
+            num_batches=total_batches,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            vocab_size=args.vocab_size,
+            shift_start_batch=shift_start_batch,
+            rare_inject_prob=args.train_rare_token_prob,
+        )
+        eval_tokens = _make_token_batches(
+            k_eval,
+            num_batches=args.eval_batches,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            vocab_size=args.vocab_size,
+            shift_start_batch=0,
+            rare_inject_prob=args.eval_rare_token_prob,
+        )
+    else:
+        print(
+            "Using real-world text stream dataset: "
+            f"{ds_cfg.name} [{ds_cfg.config or 'default'}]"
+        )
+        train_tokens = _make_hf_stream_batches(
+            ds_cfg,
+            split=ds_cfg.train_split,
+            seed=args.seed + 11,
+            num_batches=total_batches,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            vocab_size=args.vocab_size,
+            max_docs=ds_cfg.train_max_docs,
+        )
+        try:
+            eval_tokens = _make_hf_stream_batches(
+                ds_cfg,
+                split=ds_cfg.eval_split,
+                seed=args.seed + 29,
+                num_batches=args.eval_batches,
+                batch_size=args.batch_size,
+                seq_len=args.seq_len,
+                vocab_size=args.vocab_size,
+                max_docs=ds_cfg.eval_max_docs,
+            )
+        except Exception as exc:
+            if args.dataset_eval_fallback_to_train and ds_cfg.eval_split != ds_cfg.train_split:
+                print(
+                    f"Eval split '{ds_cfg.eval_split}' failed ({exc}). "
+                    f"Falling back to train split '{ds_cfg.train_split}'."
+                )
+                eval_tokens = _make_hf_stream_batches(
+                    ds_cfg,
+                    split=ds_cfg.train_split,
+                    seed=args.seed + 47,
+                    num_batches=args.eval_batches,
+                    batch_size=args.batch_size,
+                    seq_len=args.seq_len,
+                    vocab_size=args.vocab_size,
+                    max_docs=ds_cfg.eval_max_docs,
+                )
+            else:
+                raise
 
     step_rows: List[Dict[str, Any]] = []
     summary_rows: List[Dict[str, Any]] = []
@@ -820,6 +1055,8 @@ def run(args: argparse.Namespace) -> None:
         "distill_temperature": args.distill_temperature,
         "distill_weight": args.distill_weight,
         "label_smoothing": args.label_smoothing,
+        "data_source": args.data_source,
+        "dataset": (dataclasses.asdict(ds_cfg) if args.data_source == "hf_stream" else None),
         "model": dataclasses.asdict(model_cfg),
         "jax_version": jax.__version__,
         "jax_backend": jax.default_backend(),
@@ -867,6 +1104,22 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--shift-start-frac", type=float, default=0.5)
     p.add_argument("--train-rare-token-prob", type=float, default=0.03)
     p.add_argument("--eval-rare-token-prob", type=float, default=0.08)
+    p.add_argument("--data-source", type=str, default="synthetic")
+    p.add_argument("--dataset-name", type=str, default="cerebras/SlimPajama-627B")
+    p.add_argument("--dataset-config", type=str, default=None)
+    p.add_argument("--dataset-train-split", type=str, default="train")
+    p.add_argument("--dataset-eval-split", type=str, default="validation")
+    p.add_argument("--dataset-text-keys", type=str, default="text,content,document")
+    p.add_argument("--dataset-shuffle-buffer", type=int, default=10000)
+    p.add_argument("--dataset-max-doc-tokens", type=int, default=512)
+    p.add_argument("--dataset-train-max-docs", type=int, default=None)
+    p.add_argument("--dataset-eval-max-docs", type=int, default=None)
+    p.add_argument("--dataset-trust-remote-code", action="store_true")
+    p.add_argument(
+        "--dataset-eval-fallback-to-train",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--grad-clip-norm", type=float, default=1.0)

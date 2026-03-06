@@ -40,6 +40,16 @@ Run ablation benchmarks (CSV artifacts):
 python scripts/run_benchmarks.py
 ```
 
+Run benchmark on a real-world streamed corpus (SlimPajama / MiniPile-style):
+```bash
+python -m pip install datasets
+python scripts/run_benchmarks.py \
+  --data-source hf_stream \
+  --dataset-name cerebras/SlimPajama-627B \
+  --dataset-train-split train \
+  --dataset-eval-split validation
+```
+
 Build benchmark report from CSV artifacts:
 ```bash
 python -m pip install -e ".[report]"
