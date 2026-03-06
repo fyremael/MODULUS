@@ -6,8 +6,11 @@ import dataclasses
 import datetime as dt
 import json
 import math
+import os
+import random
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
@@ -95,6 +98,8 @@ class DatasetConfig:
     rows_endpoint: str
     rows_page_size: int
     http_max_retries: int
+    http_min_interval_sec: float
+    http_token_env: str
 
 
 def _layer_norm(x: jnp.ndarray, scale: jnp.ndarray, eps: float = 1e-5) -> jnp.ndarray:
@@ -777,6 +782,8 @@ def _make_hf_http_text_iterator(
     rows_endpoint: str,
     rows_page_size: int,
     max_retries: int,
+    min_interval_sec: float,
+    token_env: str,
 ) -> Iterator[str]:
     offset = 0
     page_len = min(max(rows_page_size, 1), 100)
@@ -786,6 +793,10 @@ def _make_hf_http_text_iterator(
             "(datasets-server /rows max length is 100)."
         )
     endpoint = rows_endpoint.rstrip("/")
+    token = os.environ.get(token_env) if token_env else None
+    headers = {"accept": "application/json", "user-agent": "modulus-benchmark/1.0"}
+    if token:
+        headers["authorization"] = f"Bearer {token}"
 
     while True:
         query = {
@@ -802,15 +813,36 @@ def _make_hf_http_text_iterator(
         last_error: Optional[BaseException] = None
         for attempt in range(max_retries + 1):
             try:
-                req = urllib.request.Request(url, headers={"accept": "application/json"})
+                req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
                 break
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                if exc.code == 429 and attempt < max_retries:
+                    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                    if retry_after is not None:
+                        try:
+                            sleep_s = max(float(retry_after), min_interval_sec)
+                        except ValueError:
+                            sleep_s = min_interval_sec
+                    else:
+                        sleep_s = max(min_interval_sec, 2.0 * (attempt + 1))
+                    sleep_s += random.uniform(0.0, 0.5)
+                    print(
+                        f"HTTP 429 from datasets-server; backing off {sleep_s:.2f}s "
+                        f"(attempt {attempt + 1}/{max_retries})."
+                    )
+                    time.sleep(sleep_s)
+                    continue
+                if attempt >= max_retries:
+                    break
+                time.sleep(max(min_interval_sec, 1.0 + attempt))
             except Exception as exc:
                 last_error = exc
                 if attempt >= max_retries:
                     break
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(max(min_interval_sec, 1.5 * (attempt + 1)))
 
         if payload is None:
             raise RuntimeError(
@@ -830,6 +862,8 @@ def _make_hf_http_text_iterator(
                         yield text
 
         offset += len(rows)
+        if min_interval_sec > 0:
+            time.sleep(min_interval_sec)
 
 
 def _make_hf_http_batches(
@@ -851,6 +885,8 @@ def _make_hf_http_batches(
         rows_endpoint=ds_cfg.rows_endpoint,
         rows_page_size=ds_cfg.rows_page_size,
         max_retries=ds_cfg.http_max_retries,
+        min_interval_sec=ds_cfg.http_min_interval_sec,
+        token_env=ds_cfg.http_token_env,
     )
     flat, docs_seen = _collect_stream_token_ids(
         text_iter,
@@ -883,6 +919,8 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--token-pool-batches must be >= 1")
     if args.target_runtime_minutes < 0:
         raise ValueError("--target-runtime-minutes must be >= 0")
+    if args.dataset_http_min_interval_sec < 0:
+        raise ValueError("--dataset-http-min-interval-sec must be >= 0")
     if args.max_steps is not None and args.max_steps < args.steps:
         raise ValueError("--max-steps must be >= --steps")
     if not (0.0 <= args.distill_weight <= 1.0):
@@ -930,6 +968,8 @@ def run(args: argparse.Namespace) -> None:
         rows_endpoint=args.dataset_rows_endpoint,
         rows_page_size=args.dataset_rows_page_size,
         http_max_retries=args.dataset_http_max_retries,
+        http_min_interval_sec=args.dataset_http_min_interval_sec,
+        http_token_env=args.dataset_http_token_env,
     )
     mask = _causal_mask(args.seq_len)
 
@@ -977,6 +1017,12 @@ def run(args: argparse.Namespace) -> None:
             "Using real-world text stream dataset: "
             f"{ds_cfg.name} [{ds_cfg.config or 'default'}]"
         )
+        if args.data_source == "hf_http":
+            token_present = bool(ds_cfg.http_token_env and os.environ.get(ds_cfg.http_token_env))
+            print(
+                f"hf_http auth env {ds_cfg.http_token_env!r}: "
+                f"{'set' if token_present else 'not set'}"
+            )
         if args.data_source == "hf_stream":
             train_tokens = _make_hf_stream_batches(
                 ds_cfg,
@@ -1386,7 +1432,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default="https://datasets-server.huggingface.co/rows",
     )
     p.add_argument("--dataset-rows-page-size", type=int, default=100)
-    p.add_argument("--dataset-http-max-retries", type=int, default=4)
+    p.add_argument("--dataset-http-max-retries", type=int, default=10)
+    p.add_argument("--dataset-http-min-interval-sec", type=float, default=0.35)
+    p.add_argument("--dataset-http-token-env", type=str, default="HF_TOKEN")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--grad-clip-norm", type=float, default=1.0)

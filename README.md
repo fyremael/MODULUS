@@ -50,6 +50,10 @@ python scripts/run_benchmarks.py \
   --dataset-eval-split validation
 ```
 Note: for `hf_http`, keep `--dataset-rows-page-size` at `<=100` (HF API limit).
+For higher request budgets, set `HF_TOKEN` in the environment and the runner will
+send `Authorization: Bearer ...` to dataset-server.
+If rate-limited, increase `--dataset-http-max-retries` and
+`--dataset-http-min-interval-sec`.
 
 If a dataset is unavailable in your environment, switch to another public stream
 (for example `--dataset-name cerebras/SlimPajama-627B`) or log in with
