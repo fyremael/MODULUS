@@ -522,6 +522,12 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], fieldnames: Sequen
             writer.writerow(r)
 
 
+def _fmt_metric(v: float, digits: int = 4) -> str:
+    if isinstance(v, float) and math.isnan(v):
+        return "nan"
+    return f"{v:.{digits}f}"
+
+
 def _make_token_batches(
     key: jax.Array,
     *,
@@ -913,6 +919,8 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--vocab-size must be >= 16")
     if args.eval_batches < 1:
         raise ValueError("--eval-batches must be >= 1")
+    if args.log_interval < 0:
+        raise ValueError("--log-interval must be >= 0")
     if args.steps < 1:
         raise ValueError("--steps must be >= 1")
     if args.token_pool_batches < 1:
@@ -1086,6 +1094,10 @@ def run(args: argparse.Namespace) -> None:
     summary_rows: List[Dict[str, Any]] = []
 
     for cfg in configs:
+        print(
+            f"Starting config={cfg.name} "
+            f"(eval_interval={args.eval_interval}, log_interval={args.log_interval})"
+        )
         params = jax.tree.map(lambda z: jnp.array(z, copy=True), init_params)
         tx = _build_optimizer(
             cfg,
@@ -1225,6 +1237,51 @@ def run(args: argparse.Namespace) -> None:
             reached_min_steps = step_count >= min_steps
             reached_target_runtime = elapsed >= target_seconds if target_seconds > 0 else True
             reached_max_steps = (max_steps is not None) and (step_count >= max_steps)
+
+            should_log = False
+            if args.log_interval > 0 and (step_count % args.log_interval == 0):
+                should_log = True
+            if should_eval:
+                should_log = True
+            if step_count == 1:
+                should_log = True
+            if should_log:
+                avg_step_ms = step_ms_total / max(step_count, 1)
+                avg_toks_per_s = tokens_per_s_total / max(step_count, 1)
+                runtime_min = elapsed / 60.0
+                eta_by_steps_min = (
+                    max(min_steps - step_count, 0) * avg_step_ms / 60000.0
+                )
+                eta_by_runtime_min = (
+                    max(target_seconds - elapsed, 0.0) / 60.0 if target_seconds > 0 else 0.0
+                )
+                eta_min = max(eta_by_steps_min, eta_by_runtime_min)
+                progress_parts = [
+                    f"[{cfg.name}]",
+                    f"step={step_count}",
+                    f"elapsed_min={runtime_min:.2f}",
+                    f"eta_min={eta_min:.2f}",
+                    f"train_loss={_fmt_metric(loss_scalar, 6)}",
+                    f"train_ce={_fmt_metric(ce_scalar, 6)}",
+                    f"train_kl={_fmt_metric(kl_scalar, 6)}",
+                    f"avg_step_ms={_fmt_metric(avg_step_ms, 2)}",
+                    f"avg_tok_s={_fmt_metric(avg_toks_per_s, 2)}",
+                    f"grad_norm={_fmt_metric(grad_norm_scalar, 6)}",
+                    f"update_norm={_fmt_metric(update_norm_scalar, 6)}",
+                ]
+                if should_eval:
+                    progress_parts.append(f"val_loss={_fmt_metric(eval_loss, 6)}")
+                    progress_parts.append(f"val_ce={_fmt_metric(eval_ce, 6)}")
+                    progress_parts.append(f"val_kl={_fmt_metric(eval_kl, 6)}")
+                    progress_parts.append(f"best_val={_fmt_metric(best_eval_loss, 6)}")
+                angle = hb_metrics.get("hyperball/angle_mean", float("nan"))
+                radial = hb_metrics.get("hyperball/radial_frac_mean", float("nan"))
+                if not math.isnan(angle):
+                    progress_parts.append(f"hb_angle={_fmt_metric(angle, 6)}")
+                if not math.isnan(radial):
+                    progress_parts.append(f"hb_radial={_fmt_metric(radial, 6)}")
+                print(" | ".join(progress_parts))
+
             if reached_max_steps and not reached_target_runtime:
                 print(
                     f"WARNING: reached max_steps={max_steps} before target runtime "
@@ -1346,6 +1403,7 @@ def run(args: argparse.Namespace) -> None:
         "grad_accum_steps": args.grad_accum_steps,
         "eval_interval": args.eval_interval,
         "eval_batches": args.eval_batches,
+        "log_interval": args.log_interval,
         "shift_start_frac": args.shift_start_frac,
         "train_rare_token_prob": args.train_rare_token_prob,
         "eval_rare_token_prob": args.eval_rare_token_prob,
@@ -1407,6 +1465,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--grad-accum-steps", type=int, default=2)
     p.add_argument("--eval-interval", type=int, default=5)
     p.add_argument("--eval-batches", type=int, default=2)
+    p.add_argument("--log-interval", type=int, default=10)
     p.add_argument("--shift-start-frac", type=float, default=0.5)
     p.add_argument("--train-rare-token-prob", type=float, default=0.03)
     p.add_argument("--eval-rare-token-prob", type=float, default=0.08)

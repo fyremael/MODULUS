@@ -54,6 +54,7 @@ For higher request budgets, set `HF_TOKEN` in the environment and the runner wil
 send `Authorization: Bearer ...` to dataset-server.
 If rate-limited, increase `--dataset-http-max-retries` and
 `--dataset-http-min-interval-sec`.
+Use `--log-interval` (for example `10`) to print rich live progress lines.
 
 If a dataset is unavailable in your environment, switch to another public stream
 (for example `--dataset-name cerebras/SlimPajama-627B`) or log in with
