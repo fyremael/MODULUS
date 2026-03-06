@@ -1128,6 +1128,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--label-smoothing", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", type=str, default=None)
+    if argv is None:
+        # Colab/Jupyter kernels populate sys.argv with launcher args; ignore unknowns.
+        args, unknown = p.parse_known_args()
+        if unknown:
+            print(f"Ignoring unknown launcher args: {unknown}")
+        return args
     return p.parse_args(argv)
 
 

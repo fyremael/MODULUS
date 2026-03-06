@@ -311,6 +311,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Generate PNG plots if matplotlib is available.",
     )
+    if argv is None:
+        args, unknown = p.parse_known_args()
+        if unknown:
+            print(f"Ignoring unknown launcher args: {unknown}")
+        return args
     return p.parse_args(argv)
 
 
