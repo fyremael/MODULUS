@@ -605,7 +605,23 @@ def _make_hf_text_iterator(
         dataset = load_dataset(**load_kwargs)
     except TypeError:
         load_kwargs.pop("trust_remote_code", None)
-        dataset = load_dataset(**load_kwargs)
+        try:
+            dataset = load_dataset(**load_kwargs)
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to load dataset after retry without trust_remote_code. "
+                "Try --dataset-name JeanKaddour/minipile to validate streaming path first."
+            ) from exc
+    except Exception as exc:
+        msg = str(exc)
+        hint = (
+            "Failed to load dataset in hf_stream mode. "
+            "Try a known public fallback such as --dataset-name JeanKaddour/minipile "
+            "or authenticate with `huggingface-cli login` if the dataset is gated/private."
+        )
+        if "DatasetNotFoundError" in msg or "doesn't exist on the Hub" in msg:
+            raise RuntimeError(f"{hint} Original error: {exc}") from exc
+        raise
 
     if shuffle_buffer > 0:
         dataset = dataset.shuffle(seed=seed, buffer_size=shuffle_buffer)
@@ -1105,7 +1121,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--train-rare-token-prob", type=float, default=0.03)
     p.add_argument("--eval-rare-token-prob", type=float, default=0.08)
     p.add_argument("--data-source", type=str, default="synthetic")
-    p.add_argument("--dataset-name", type=str, default="cerebras/SlimPajama-627B")
+    p.add_argument("--dataset-name", type=str, default="JeanKaddour/minipile")
     p.add_argument("--dataset-config", type=str, default=None)
     p.add_argument("--dataset-train-split", type=str, default="train")
     p.add_argument("--dataset-eval-split", type=str, default="validation")

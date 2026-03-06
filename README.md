@@ -45,10 +45,14 @@ Run benchmark on a real-world streamed corpus (SlimPajama / MiniPile-style):
 python -m pip install datasets
 python scripts/run_benchmarks.py \
   --data-source hf_stream \
-  --dataset-name cerebras/SlimPajama-627B \
+  --dataset-name JeanKaddour/minipile \
   --dataset-train-split train \
   --dataset-eval-split validation
 ```
+
+If a dataset is unavailable in your environment, switch to another public stream
+(for example `--dataset-name cerebras/SlimPajama-627B`) or log in with
+`huggingface-cli login` for gated datasets.
 
 Build benchmark report from CSV artifacts:
 ```bash
