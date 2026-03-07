@@ -49,6 +49,7 @@ python scripts/run_benchmarks.py \
   --dataset-train-split train \
   --dataset-eval-split train \
   --hardware-aware \
+  --auto-adjust-max-steps-for-token-target \
   --param-dtype auto \
   --max-tokens-per-step 4096 \
   --max-logits-elements 33554432 \

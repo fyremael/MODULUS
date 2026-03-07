@@ -1167,6 +1167,7 @@ def run(args: argparse.Namespace) -> None:
     requested_grad_accum_steps = args.grad_accum_steps
     requested_distill_weight = args.distill_weight
     requested_param_dtype = args.param_dtype
+    requested_max_steps = args.max_steps
     detected_backend = jax.default_backend()
     detected_device_kind = str(jax.devices()[0]) if jax.devices() else "unknown"
     resolved_max_tokens_per_step = args.max_tokens_per_step
@@ -1361,10 +1362,18 @@ def run(args: argparse.Namespace) -> None:
     if args.target_train_tokens is not None:
         target_token_steps = math.ceil(args.target_train_tokens / float(tokens_per_step))
         if args.max_steps is not None and args.max_steps < target_token_steps:
-            raise ValueError(
-                "--max-steps is smaller than steps required by --target-train-tokens. "
-                "Increase --max-steps or lower --target-train-tokens."
-            )
+            if args.hardware_aware and args.auto_adjust_max_steps_for_token_target:
+                print(
+                    "hardware-aware: increasing max_steps "
+                    f"{args.max_steps} -> {target_token_steps} "
+                    f"to satisfy target_train_tokens={args.target_train_tokens}"
+                )
+                args.max_steps = target_token_steps
+            else:
+                raise ValueError(
+                    "--max-steps is smaller than steps required by --target-train-tokens. "
+                    "Increase --max-steps or lower --target-train-tokens."
+                )
     min_steps = max(args.steps, target_token_steps)
     default_lr_total_steps = args.max_steps if args.max_steps is not None else min_steps
     lr_total_steps = (
@@ -1941,6 +1950,7 @@ def run(args: argparse.Namespace) -> None:
         "requested_grad_accum_steps": requested_grad_accum_steps,
         "requested_distill_weight": requested_distill_weight,
         "requested_param_dtype": requested_param_dtype,
+        "requested_max_steps": requested_max_steps,
         "resolved_param_dtype": resolved_param_dtype,
         "estimated_param_count": estimated_param_count,
         "batch_size": args.batch_size,
@@ -2012,6 +2022,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--steps", type=int, default=40)
     p.add_argument("--max-steps", type=int, default=None)
+    p.add_argument(
+        "--auto-adjust-max-steps-for-token-target",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     p.add_argument("--target-runtime-minutes", type=float, default=0.0)
     p.add_argument("--target-train-tokens", type=int, default=None)
     p.add_argument("--warmup-steps", type=int, default=6)
