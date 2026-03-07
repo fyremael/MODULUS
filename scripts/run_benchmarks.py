@@ -1360,6 +1360,7 @@ def run(args: argparse.Namespace) -> None:
                 f"lr_warmup_steps={args.lr_warmup_steps}, lr_min_ratio={args.lr_min_ratio:.4f}, "
                 f"lr_total_steps={lr_total_steps})"
             )
+            print("  - init: copying params and building optimizer...")
             params = jax.tree.map(lambda z: jnp.array(z, copy=True), init_params)
             tx = _build_optimizer(
                 cfg,
@@ -1368,7 +1369,11 @@ def run(args: argparse.Namespace) -> None:
                 wd=args.weight_decay,
                 grad_clip_norm=args.grad_clip_norm,
             )
+            opt_init_t0 = time.perf_counter()
             opt_state = tx.init(params)
+            print(f"  - init: optimizer state ready in {(time.perf_counter() - opt_init_t0):.2f}s")
+
+            print("  - jit: creating step/eval functions...")
             step_fn = _make_step_fn(
                 tx=tx,
                 teacher_params=teacher_params,
@@ -1384,9 +1389,16 @@ def run(args: argparse.Namespace) -> None:
                 objective_cfg=objective_cfg,
                 causal_mask=mask,
             )
+            print("  - jit: functions created")
 
             # JIT warmup (excluded from timing rows).
+            if args.warmup_steps > 0:
+                print(
+                    f"  - warmup: running {args.warmup_steps} step(s); "
+                    "step 1 triggers XLA compile and may take several minutes on TPU."
+                )
             for i in range(args.warmup_steps):
+                warm_step_t0 = time.perf_counter()
                 params, opt_state, loss_val, ce_val, kl_val, grad_norm, update_norm = step_fn(
                     params, opt_state, train_tokens[i]
                 )
@@ -1395,6 +1407,11 @@ def run(args: argparse.Namespace) -> None:
                 jax.block_until_ready(kl_val)
                 jax.block_until_ready(grad_norm)
                 jax.block_until_ready(update_norm)
+                warm_step_s = time.perf_counter() - warm_step_t0
+                if i == 0:
+                    print(f"  - warmup: step 1 compile+execute complete in {warm_step_s:.2f}s")
+                elif i + 1 == args.warmup_steps:
+                    print(f"  - warmup: final step complete in {warm_step_s:.2f}s")
 
             target_seconds = args.target_runtime_minutes * 60.0
             max_steps = args.max_steps
