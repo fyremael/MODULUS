@@ -48,6 +48,10 @@ python scripts/run_benchmarks.py \
   --dataset-config sample-10BT \
   --dataset-train-split train \
   --dataset-eval-split train \
+  --hardware-aware \
+  --max-tokens-per-step 8192 \
+  --auto-token-pool-by-host-ram \
+  --host-ram-token-pool-fraction 0.20 \
   --dataset-http-cache-dir artifacts/datasets/hf_http_cache \
   --dataset-http-cache-read \
   --dataset-http-cache-write \
@@ -64,6 +68,8 @@ If rate-limited, increase `--dataset-http-max-retries` and
 Use `--log-interval` (for example `10`) to print rich live progress lines.
 For long runs, increase `--step-record-interval` (for example `10` or `25`) to
 reduce memory and CSV size while preserving eval snapshots.
+Hardware-aware mode is on by default and can downshift `batch_size` or
+`token_pool_batches` when requested settings exceed device/host limits.
 For `hf_stream` mode, set `HF_HOME` / `HF_DATASETS_CACHE` to a persistent path
 to reuse downloaded shards across reruns.
 

@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from array import array
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
@@ -567,6 +568,40 @@ def _fmt_metric(v: float, digits: int = 4) -> str:
     return f"{v:.{digits}f}"
 
 
+def _default_max_tokens_per_step(backend: str, device_kind: str) -> int:
+    kind = device_kind.lower()
+    if backend == "tpu":
+        if "v6e" in kind or "v5p" in kind:
+            return 8192
+        if "v4" in kind or "v5e" in kind:
+            return 6144
+        return 4096
+    if backend == "gpu":
+        if "h100" in kind or "a100" in kind:
+            return 8192
+        return 4096
+    return 2048
+
+
+def _available_host_ram_bytes() -> Optional[int]:
+    try:
+        import psutil  # type: ignore
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+
+    try:
+        if hasattr(os, "sysconf"):
+            pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            if pages > 0 and page_size > 0:
+                return pages * page_size
+    except Exception:
+        pass
+    return None
+
+
 def _make_token_batches(
     key: jax.Array,
     *,
@@ -741,7 +776,7 @@ def _collect_stream_token_ids(
     max_docs: Optional[int],
     progress_label: str,
 ) -> Tuple[jnp.ndarray, int]:
-    flat_tokens: List[int] = []
+    flat_tokens = array("I")
     docs_seen = 0
 
     for text in text_iter:
@@ -1003,8 +1038,6 @@ def _make_hf_http_batches(
 def run(args: argparse.Namespace) -> None:
     if args.width % args.num_heads != 0:
         raise ValueError("--width must be divisible by --num-heads")
-    if args.batch_size % args.grad_accum_steps != 0:
-        raise ValueError("--batch-size must be divisible by --grad-accum-steps")
     if args.seq_len < 2:
         raise ValueError("--seq-len must be >= 2 for next-token objective")
     if args.vocab_size < 16:
@@ -1019,6 +1052,8 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--steps must be >= 1")
     if args.token_pool_batches < 1:
         raise ValueError("--token-pool-batches must be >= 1")
+    if args.host_ram_token_pool_fraction <= 0.0 or args.host_ram_token_pool_fraction > 1.0:
+        raise ValueError("--host-ram-token-pool-fraction must be in (0, 1]")
     if args.target_runtime_minutes < 0:
         raise ValueError("--target-runtime-minutes must be >= 0")
     if args.lr <= 0:
@@ -1057,6 +1092,46 @@ def run(args: argparse.Namespace) -> None:
     out_root = root / "artifacts" / "benchmarks"
     out_dir = _timestamp_dir(out_root) if args.out_dir is None else Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    requested_batch_size = args.batch_size
+    requested_grad_accum_steps = args.grad_accum_steps
+    detected_backend = jax.default_backend()
+    detected_device_kind = str(jax.devices()[0]) if jax.devices() else "unknown"
+    resolved_max_tokens_per_step = args.max_tokens_per_step
+    if args.hardware_aware:
+        if resolved_max_tokens_per_step is None:
+            device_kind_str = (
+                getattr(jax.devices()[0], "device_kind", "") if jax.devices() else ""
+            )
+            resolved_max_tokens_per_step = _default_max_tokens_per_step(
+                detected_backend, device_kind_str
+            )
+        if resolved_max_tokens_per_step < 1:
+            raise ValueError("--max-tokens-per-step must be >= 1 when provided")
+
+        tokens_per_step_requested = args.batch_size * args.seq_len
+        if tokens_per_step_requested > resolved_max_tokens_per_step:
+            target_batch = max(resolved_max_tokens_per_step // args.seq_len, 1)
+            if args.grad_accum_steps > target_batch:
+                print(
+                    f"hardware-aware: grad_accum_steps={args.grad_accum_steps} "
+                    f"> target_batch={target_batch}; forcing grad_accum_steps=1"
+                )
+                args.grad_accum_steps = 1
+            if args.grad_accum_steps > 1:
+                target_batch = max(
+                    args.grad_accum_steps,
+                    (target_batch // args.grad_accum_steps) * args.grad_accum_steps,
+                )
+            args.batch_size = max(target_batch, 1)
+            print(
+                "hardware-aware: reducing batch size "
+                f"{requested_batch_size} -> {args.batch_size} "
+                f"for seq_len={args.seq_len} and max_tokens_per_step={resolved_max_tokens_per_step}"
+            )
+
+    if args.batch_size % args.grad_accum_steps != 0:
+        raise ValueError("--batch-size must be divisible by --grad-accum-steps")
 
     model_cfg = ModelConfig(
         width=args.width,
@@ -1111,6 +1186,23 @@ def run(args: argparse.Namespace) -> None:
     train_pool_batches = max(args.token_pool_batches, args.warmup_steps + 1)
     shift_start_batch = int(train_pool_batches * args.shift_start_frac)
     tokens_per_step = args.batch_size * args.seq_len
+    if args.auto_token_pool_by_host_ram:
+        avail_ram = _available_host_ram_bytes()
+        if avail_ram is not None:
+            bytes_per_batch = args.batch_size * args.seq_len * 4
+            budget_bytes = int(avail_ram * args.host_ram_token_pool_fraction)
+            eval_bytes = args.eval_batches * bytes_per_batch
+            if budget_bytes > eval_bytes + bytes_per_batch:
+                max_train_batches = (budget_bytes - eval_bytes) // max(bytes_per_batch, 1)
+                max_train_batches = max(max_train_batches, args.warmup_steps + 1)
+                if max_train_batches < train_pool_batches:
+                    print(
+                        "hardware-aware: reducing token_pool_batches "
+                        f"{train_pool_batches} -> {max_train_batches} "
+                        f"(host_ram_budget={budget_bytes // (1024**2)}MiB)"
+                    )
+                    train_pool_batches = int(max_train_batches)
+                    shift_start_batch = int(train_pool_batches * args.shift_start_frac)
     target_token_steps = 0
     if args.target_train_tokens is not None:
         target_token_steps = math.ceil(args.target_train_tokens / float(tokens_per_step))
@@ -1263,6 +1355,7 @@ def run(args: argparse.Namespace) -> None:
                 f"Starting config={cfg.name} "
                 f"(eval_interval={args.eval_interval}, log_interval={args.log_interval}, "
                 f"step_record_interval={args.step_record_interval}, "
+                f"batch_size={args.batch_size}, grad_accum_steps={args.grad_accum_steps}, "
                 f"lr={args.lr:.6g}, lr_schedule={args.lr_schedule}, "
                 f"lr_warmup_steps={args.lr_warmup_steps}, lr_min_ratio={args.lr_min_ratio:.4f}, "
                 f"lr_total_steps={lr_total_steps})"
@@ -1591,10 +1684,18 @@ def run(args: argparse.Namespace) -> None:
     meta = {
         "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "seed": args.seed,
+        "hardware_aware": args.hardware_aware,
+        "detected_backend": detected_backend,
+        "detected_device_kind": detected_device_kind,
+        "max_tokens_per_step": resolved_max_tokens_per_step,
+        "requested_batch_size": requested_batch_size,
+        "requested_grad_accum_steps": requested_grad_accum_steps,
         "batch_size": args.batch_size,
         "steps": args.steps,
         "max_steps": args.max_steps,
         "target_runtime_minutes": args.target_runtime_minutes,
+        "auto_token_pool_by_host_ram": args.auto_token_pool_by_host_ram,
+        "host_ram_token_pool_fraction": args.host_ram_token_pool_fraction,
         "token_pool_batches": train_pool_batches,
         "tokens_per_step": tokens_per_step,
         "target_train_tokens": args.target_train_tokens,
@@ -1658,6 +1759,18 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--target-train-tokens", type=int, default=None)
     p.add_argument("--warmup-steps", type=int, default=6)
     p.add_argument("--token-pool-batches", type=int, default=256)
+    p.add_argument(
+        "--hardware-aware",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    p.add_argument("--max-tokens-per-step", type=int, default=None)
+    p.add_argument(
+        "--auto-token-pool-by-host-ram",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    p.add_argument("--host-ram-token-pool-fraction", type=float, default=0.25)
     p.add_argument(
         "--configs",
         type=str,
