@@ -108,11 +108,13 @@ class DatasetConfig:
 
 
 def _layer_norm(x: jnp.ndarray, scale: jnp.ndarray, eps: float = 1e-5) -> jnp.ndarray:
+    x_dtype = x.dtype
     x32 = x.astype(jnp.float32)
     mean = jnp.mean(x32, axis=-1, keepdims=True)
     var = jnp.mean((x32 - mean) ** 2, axis=-1, keepdims=True)
     y = (x32 - mean) / jnp.sqrt(var + eps)
-    return y * scale.astype(jnp.float32)
+    out = y * scale.astype(jnp.float32)
+    return out.astype(x_dtype)
 
 
 def _split_heads(x: jnp.ndarray, num_heads: int) -> jnp.ndarray:
@@ -143,7 +145,6 @@ def _model_forward(
 
     x = params["embed"]["token_embedding"][tokens]
     x = x + params["embed"]["pos_embedding"][None, :seqlen, :]
-    x = x.astype(jnp.float32)
 
     for layer_idx in range(model_cfg.num_layers):
         blk = params[f"block_{layer_idx}"]
@@ -177,7 +178,12 @@ def _model_forward(
     return x @ params["lm_head"]["kernel"]
 
 
-def _make_initial_params(key: jax.Array, model_cfg: ModelConfig) -> Dict[str, Any]:
+def _make_initial_params(
+    key: jax.Array,
+    model_cfg: ModelConfig,
+    *,
+    param_dtype: jnp.dtype,
+) -> Dict[str, Any]:
     keys = iter(jax.random.split(key, 6 + model_cfg.num_layers * 8))
 
     def next_key() -> jax.Array:
@@ -191,17 +197,17 @@ def _make_initial_params(key: jax.Array, model_cfg: ModelConfig) -> Dict[str, An
         "embed": {
             "token_embedding": jax.random.normal(
                 next_key(), (model_cfg.vocab_size, model_cfg.width)
-            ).astype(jnp.float32)
+            ).astype(param_dtype)
             * 0.02,
             "pos_embedding": jax.random.normal(
                 next_key(), (model_cfg.seq_len, model_cfg.width)
-            ).astype(jnp.float32)
+            ).astype(param_dtype)
             * 0.01,
         },
-        "final_norm": {"scale": jnp.ones((model_cfg.width,), dtype=jnp.float32)},
+        "final_norm": {"scale": jnp.ones((model_cfg.width,), dtype=param_dtype)},
         "lm_head": {
             "kernel": jax.random.normal(next_key(), (model_cfg.width, model_cfg.vocab_size)).astype(
-                jnp.float32
+                param_dtype
             )
             * w_scale
         },
@@ -212,32 +218,32 @@ def _make_initial_params(key: jax.Array, model_cfg: ModelConfig) -> Dict[str, An
             "attn": {
                 "qkv_kernel": jax.random.normal(
                     next_key(), (model_cfg.width, 3 * model_cfg.width)
-                ).astype(jnp.float32)
+                ).astype(param_dtype)
                 * w_scale,
                 "out_kernel": jax.random.normal(
                     next_key(), (model_cfg.width, model_cfg.width)
-                ).astype(jnp.float32)
+                ).astype(param_dtype)
                 * w_scale,
             },
             "mlp": {
                 "up_kernel": jax.random.normal(
                     next_key(), (model_cfg.width, model_cfg.mlp_hidden)
-                ).astype(jnp.float32)
+                ).astype(param_dtype)
                 * mlp_up_scale,
                 "down_kernel": jax.random.normal(
                     next_key(), (model_cfg.mlp_hidden, model_cfg.width)
-                ).astype(jnp.float32)
+                ).astype(param_dtype)
                 * mlp_down_scale,
                 "adapter": {
                     "lora_A": jax.random.normal(
                         next_key(), (model_cfg.width, model_cfg.lora_rank)
-                    ).astype(jnp.float32)
+                    ).astype(param_dtype)
                     * 0.01,
-                    "lora_B": jnp.zeros((model_cfg.lora_rank, model_cfg.width), dtype=jnp.float32),
+                    "lora_B": jnp.zeros((model_cfg.lora_rank, model_cfg.width), dtype=param_dtype),
                 },
             },
-            "norm1": {"scale": jnp.ones((model_cfg.width,), dtype=jnp.float32)},
-            "norm2": {"scale": jnp.ones((model_cfg.width,), dtype=jnp.float32)},
+            "norm1": {"scale": jnp.ones((model_cfg.width,), dtype=param_dtype)},
+            "norm2": {"scale": jnp.ones((model_cfg.width,), dtype=param_dtype)},
         }
 
     return params
@@ -380,24 +386,28 @@ def _objective(
         model_cfg=model_cfg,
         causal_mask=causal_mask,
         use_lora=True,
-    )
-    teacher_logits = jax.lax.stop_gradient(
-        _model_forward(
-            teacher_params,
-            tokens,
-            model_cfg=model_cfg,
-            causal_mask=causal_mask,
-            use_lora=False,
-        )
-    )
+    ).astype(jnp.float32)
 
-    temp = jnp.asarray(objective_cfg.distill_temperature, dtype=jnp.float32)
-    student_log_probs = jax.nn.log_softmax(student_logits / temp, axis=-1)
-    teacher_probs = jax.nn.softmax(teacher_logits / temp, axis=-1)
-    teacher_log_probs = jax.nn.log_softmax(teacher_logits / temp, axis=-1)
-    distill_kl = jnp.mean(
-        jnp.sum(teacher_probs * (teacher_log_probs - student_log_probs), axis=-1)
-    ) * (temp**2)
+    if objective_cfg.distill_weight > 0.0:
+        teacher_logits = jax.lax.stop_gradient(
+            _model_forward(
+                teacher_params,
+                tokens,
+                model_cfg=model_cfg,
+                causal_mask=causal_mask,
+                use_lora=False,
+            ).astype(jnp.float32)
+        )
+
+        temp = jnp.asarray(objective_cfg.distill_temperature, dtype=jnp.float32)
+        student_log_probs = jax.nn.log_softmax(student_logits / temp, axis=-1)
+        teacher_probs = jax.nn.softmax(teacher_logits / temp, axis=-1)
+        teacher_log_probs = jax.nn.log_softmax(teacher_logits / temp, axis=-1)
+        distill_kl = jnp.mean(
+            jnp.sum(teacher_probs * (teacher_log_probs - student_log_probs), axis=-1)
+        ) * (temp**2)
+    else:
+        distill_kl = jnp.asarray(0.0, dtype=jnp.float32)
 
     next_token_ce = _next_token_ce(
         student_logits,
@@ -644,6 +654,17 @@ def _is_probable_compile_oom(exc: BaseException) -> bool:
         "hlo",
     )
     return any(n in msg for n in needles)
+
+
+def _estimate_model_param_count(model_cfg: ModelConfig) -> int:
+    d = model_cfg.width
+    h = model_cfg.mlp_hidden
+    v = model_cfg.vocab_size
+    s = model_cfg.seq_len
+    num_layers = model_cfg.num_layers
+    r = model_cfg.lora_rank
+    per_layer = (4 * d * d) + (2 * d * h) + (2 * d * r) + (2 * d)
+    return (2 * v * d) + (s * d) + d + (num_layers * per_layer)
 
 
 def _make_token_batches(
@@ -1144,6 +1165,8 @@ def run(args: argparse.Namespace) -> None:
     requested_batch_size = args.batch_size
     requested_seq_len = args.seq_len
     requested_grad_accum_steps = args.grad_accum_steps
+    requested_distill_weight = args.distill_weight
+    requested_param_dtype = args.param_dtype
     detected_backend = jax.default_backend()
     detected_device_kind = str(jax.devices()[0]) if jax.devices() else "unknown"
     resolved_max_tokens_per_step = args.max_tokens_per_step
@@ -1239,6 +1262,8 @@ def run(args: argparse.Namespace) -> None:
 
     if args.batch_size % args.grad_accum_steps != 0:
         raise ValueError("--batch-size must be divisible by --grad-accum-steps")
+    if args.distill_disable_param_threshold < 1:
+        raise ValueError("--distill-disable-param-threshold must be >= 1")
 
     model_cfg = ModelConfig(
         width=args.width,
@@ -1249,6 +1274,28 @@ def run(args: argparse.Namespace) -> None:
         mlp_mult=args.mlp_mult,
         lora_rank=args.lora_rank,
     )
+    estimated_param_count = _estimate_model_param_count(model_cfg)
+    resolved_param_dtype = args.param_dtype
+    if resolved_param_dtype == "auto":
+        resolved_param_dtype = "bfloat16" if detected_backend == "tpu" else "float32"
+    if (
+        args.hardware_aware
+        and args.auto_disable_distill_for_memory
+        and detected_backend == "tpu"
+        and args.distill_weight > 0.0
+        and estimated_param_count >= args.distill_disable_param_threshold
+    ):
+        print(
+            "hardware-aware: disabling distillation "
+            f"(distill_weight {args.distill_weight} -> 0.0) "
+            f"for large model (~{estimated_param_count / 1_000_000:.1f}M params) on TPU"
+        )
+        args.distill_weight = 0.0
+    print(
+        f"hardware-aware: parameter dtype set to {resolved_param_dtype} "
+        f"(requested={requested_param_dtype})"
+    )
+    param_dtype_jnp = jnp.bfloat16 if resolved_param_dtype == "bfloat16" else jnp.float32
     objective_cfg = ObjectiveConfig(
         distill_temperature=args.distill_temperature,
         distill_weight=args.distill_weight,
@@ -1333,8 +1380,15 @@ def run(args: argparse.Namespace) -> None:
 
     rng = jax.random.PRNGKey(args.seed)
     k_student, k_teacher, k_train, k_eval = jax.random.split(rng, 4)
-    init_params = _make_initial_params(k_student, model_cfg=model_cfg)
-    teacher_params = _make_initial_params(k_teacher, model_cfg=model_cfg)
+    init_params = _make_initial_params(
+        k_student, model_cfg=model_cfg, param_dtype=param_dtype_jnp
+    )
+    if objective_cfg.distill_weight > 0.0:
+        teacher_params = _make_initial_params(
+            k_teacher, model_cfg=model_cfg, param_dtype=param_dtype_jnp
+        )
+    else:
+        teacher_params = {}
     if args.data_source == "synthetic":
         train_tokens = _make_token_batches(
             k_train,
@@ -1470,6 +1524,8 @@ def run(args: argparse.Namespace) -> None:
                     f"batch_size={runtime_batch_size}, "
                     f"grad_accum_steps={runtime_grad_accum_steps}, "
                     f"seq_len={args.seq_len}, "
+                    f"param_dtype={resolved_param_dtype}, "
+                    f"distill_weight={args.distill_weight:.3f}, "
                     f"lr={args.lr:.6g}, lr_schedule={args.lr_schedule}, "
                     f"lr_warmup_steps={args.lr_warmup_steps}, "
                     f"lr_min_ratio={args.lr_min_ratio:.4f}, "
@@ -1883,6 +1939,10 @@ def run(args: argparse.Namespace) -> None:
         "requested_batch_size": requested_batch_size,
         "requested_seq_len": requested_seq_len,
         "requested_grad_accum_steps": requested_grad_accum_steps,
+        "requested_distill_weight": requested_distill_weight,
+        "requested_param_dtype": requested_param_dtype,
+        "resolved_param_dtype": resolved_param_dtype,
+        "estimated_param_count": estimated_param_count,
         "batch_size": args.batch_size,
         "steps": args.steps,
         "max_steps": args.max_steps,
@@ -1897,6 +1957,8 @@ def run(args: argparse.Namespace) -> None:
         "warmup_steps": args.warmup_steps,
         "compile_retry_attempts": args.compile_retry_attempts,
         "auto_seq_len_by_memory": args.auto_seq_len_by_memory,
+        "auto_disable_distill_for_memory": args.auto_disable_distill_for_memory,
+        "distill_disable_param_threshold": args.distill_disable_param_threshold,
         "lr": args.lr,
         "lr_schedule": args.lr_schedule,
         "lr_warmup_steps": args.lr_warmup_steps,
@@ -1959,6 +2021,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    p.add_argument(
+        "--param-dtype",
+        type=str,
+        default="auto",
+        choices=("auto", "float32", "bfloat16"),
+    )
     p.add_argument("--max-tokens-per-step", type=int, default=None)
     p.add_argument("--max-logits-elements", type=int, default=None)
     p.add_argument("--max-attention-elements", type=int, default=None)
@@ -1967,6 +2035,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    p.add_argument(
+        "--auto-disable-distill-for-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    p.add_argument("--distill-disable-param-threshold", type=int, default=120000000)
     p.add_argument(
         "--auto-token-pool-by-host-ram",
         action=argparse.BooleanOptionalAction,
