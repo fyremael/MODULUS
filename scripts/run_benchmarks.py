@@ -583,6 +583,21 @@ def _default_max_tokens_per_step(backend: str, device_kind: str) -> int:
     return 2048
 
 
+def _default_max_logits_elements(backend: str, device_kind: str) -> int:
+    kind = device_kind.lower()
+    if backend == "tpu":
+        if "v6e" in kind:
+            return 33_554_432
+        if "v5e" in kind or "v4" in kind:
+            return 25_165_824
+        return 20_971_520
+    if backend == "gpu":
+        if "h100" in kind or "a100" in kind:
+            return 67_108_864
+        return 33_554_432
+    return 16_777_216
+
+
 def _available_host_ram_bytes() -> Optional[int]:
     try:
         import psutil  # type: ignore
@@ -1114,16 +1129,21 @@ def run(args: argparse.Namespace) -> None:
     detected_backend = jax.default_backend()
     detected_device_kind = str(jax.devices()[0]) if jax.devices() else "unknown"
     resolved_max_tokens_per_step = args.max_tokens_per_step
+    resolved_max_logits_elements = args.max_logits_elements
     if args.hardware_aware:
+        device_kind_str = getattr(jax.devices()[0], "device_kind", "") if jax.devices() else ""
         if resolved_max_tokens_per_step is None:
-            device_kind_str = (
-                getattr(jax.devices()[0], "device_kind", "") if jax.devices() else ""
-            )
             resolved_max_tokens_per_step = _default_max_tokens_per_step(
+                detected_backend, device_kind_str
+            )
+        if resolved_max_logits_elements is None:
+            resolved_max_logits_elements = _default_max_logits_elements(
                 detected_backend, device_kind_str
             )
         if resolved_max_tokens_per_step < 1:
             raise ValueError("--max-tokens-per-step must be >= 1 when provided")
+        if resolved_max_logits_elements < 1:
+            raise ValueError("--max-logits-elements must be >= 1 when provided")
 
         tokens_per_step_requested = args.batch_size * args.seq_len
         if tokens_per_step_requested > resolved_max_tokens_per_step:
@@ -1144,6 +1164,28 @@ def run(args: argparse.Namespace) -> None:
                 "hardware-aware: reducing batch size "
                 f"{requested_batch_size} -> {args.batch_size} "
                 f"for seq_len={args.seq_len} and max_tokens_per_step={resolved_max_tokens_per_step}"
+            )
+        logits_elements_requested = args.batch_size * args.seq_len * args.vocab_size
+        if logits_elements_requested > resolved_max_logits_elements:
+            target_batch = max(resolved_max_logits_elements // (args.seq_len * args.vocab_size), 1)
+            if args.grad_accum_steps > target_batch:
+                print(
+                    f"hardware-aware: grad_accum_steps={args.grad_accum_steps} "
+                    f"> target_batch={target_batch}; forcing grad_accum_steps=1"
+                )
+                args.grad_accum_steps = 1
+            if args.grad_accum_steps > 1:
+                target_batch = max(
+                    args.grad_accum_steps,
+                    (target_batch // args.grad_accum_steps) * args.grad_accum_steps,
+                )
+            prev_batch = args.batch_size
+            args.batch_size = max(target_batch, 1)
+            print(
+                "hardware-aware: reducing batch size "
+                f"{prev_batch} -> {args.batch_size} "
+                f"for seq_len={args.seq_len}, vocab_size={args.vocab_size}, "
+                f"max_logits_elements={resolved_max_logits_elements}"
             )
 
     if args.batch_size % args.grad_accum_steps != 0:
@@ -1786,6 +1828,7 @@ def run(args: argparse.Namespace) -> None:
         "detected_backend": detected_backend,
         "detected_device_kind": detected_device_kind,
         "max_tokens_per_step": resolved_max_tokens_per_step,
+        "max_logits_elements": resolved_max_logits_elements,
         "requested_batch_size": requested_batch_size,
         "requested_grad_accum_steps": requested_grad_accum_steps,
         "batch_size": args.batch_size,
@@ -1864,6 +1907,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=True,
     )
     p.add_argument("--max-tokens-per-step", type=int, default=None)
+    p.add_argument("--max-logits-elements", type=int, default=None)
     p.add_argument(
         "--auto-token-pool-by-host-ram",
         action=argparse.BooleanOptionalAction,

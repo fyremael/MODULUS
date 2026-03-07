@@ -50,6 +50,7 @@ python scripts/run_benchmarks.py \
   --dataset-eval-split train \
   --hardware-aware \
   --max-tokens-per-step 4096 \
+  --max-logits-elements 33554432 \
   --compile-retry-attempts 3 \
   --auto-token-pool-by-host-ram \
   --host-ram-token-pool-fraction 0.20 \
