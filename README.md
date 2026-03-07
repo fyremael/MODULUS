@@ -51,6 +51,8 @@ python scripts/run_benchmarks.py \
   --hardware-aware \
   --max-tokens-per-step 4096 \
   --max-logits-elements 33554432 \
+  --max-attention-elements 8388608 \
+  --auto-seq-len-by-memory \
   --compile-retry-attempts 3 \
   --auto-token-pool-by-host-ram \
   --host-ram-token-pool-fraction 0.20 \

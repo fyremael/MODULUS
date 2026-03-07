@@ -598,6 +598,21 @@ def _default_max_logits_elements(backend: str, device_kind: str) -> int:
     return 16_777_216
 
 
+def _default_max_attention_elements(backend: str, device_kind: str) -> int:
+    kind = device_kind.lower()
+    if backend == "tpu":
+        if "v6e" in kind:
+            return 8_388_608
+        if "v5e" in kind or "v4" in kind:
+            return 6_291_456
+        return 4_194_304
+    if backend == "gpu":
+        if "h100" in kind or "a100" in kind:
+            return 16_777_216
+        return 8_388_608
+    return 2_097_152
+
+
 def _available_host_ram_bytes() -> Optional[int]:
     try:
         import psutil  # type: ignore
@@ -1083,6 +1098,8 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--steps must be >= 1")
     if args.token_pool_batches < 1:
         raise ValueError("--token-pool-batches must be >= 1")
+    if args.num_heads < 1:
+        raise ValueError("--num-heads must be >= 1")
     if args.host_ram_token_pool_fraction <= 0.0 or args.host_ram_token_pool_fraction > 1.0:
         raise ValueError("--host-ram-token-pool-fraction must be in (0, 1]")
     if args.target_runtime_minutes < 0:
@@ -1125,11 +1142,13 @@ def run(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     requested_batch_size = args.batch_size
+    requested_seq_len = args.seq_len
     requested_grad_accum_steps = args.grad_accum_steps
     detected_backend = jax.default_backend()
     detected_device_kind = str(jax.devices()[0]) if jax.devices() else "unknown"
     resolved_max_tokens_per_step = args.max_tokens_per_step
     resolved_max_logits_elements = args.max_logits_elements
+    resolved_max_attention_elements = args.max_attention_elements
     if args.hardware_aware:
         device_kind_str = getattr(jax.devices()[0], "device_kind", "") if jax.devices() else ""
         if resolved_max_tokens_per_step is None:
@@ -1140,10 +1159,16 @@ def run(args: argparse.Namespace) -> None:
             resolved_max_logits_elements = _default_max_logits_elements(
                 detected_backend, device_kind_str
             )
+        if resolved_max_attention_elements is None:
+            resolved_max_attention_elements = _default_max_attention_elements(
+                detected_backend, device_kind_str
+            )
         if resolved_max_tokens_per_step < 1:
             raise ValueError("--max-tokens-per-step must be >= 1 when provided")
         if resolved_max_logits_elements < 1:
             raise ValueError("--max-logits-elements must be >= 1 when provided")
+        if resolved_max_attention_elements < 1:
+            raise ValueError("--max-attention-elements must be >= 1 when provided")
 
         tokens_per_step_requested = args.batch_size * args.seq_len
         if tokens_per_step_requested > resolved_max_tokens_per_step:
@@ -1187,6 +1212,30 @@ def run(args: argparse.Namespace) -> None:
                 f"for seq_len={args.seq_len}, vocab_size={args.vocab_size}, "
                 f"max_logits_elements={resolved_max_logits_elements}"
             )
+        if args.auto_seq_len_by_memory:
+            seq_cap_logits = max(
+                resolved_max_logits_elements // max(args.batch_size * args.vocab_size, 1),
+                2,
+            )
+            seq_cap_attention = int(
+                math.sqrt(
+                    resolved_max_attention_elements
+                    / max(args.batch_size * args.num_heads, 1)
+                )
+            )
+            seq_cap = min(args.seq_len, seq_cap_logits, seq_cap_attention)
+            if seq_cap < args.seq_len:
+                # Keep power-of-two lengths for predictable compile behavior.
+                seq_pow2 = 1 << (max(seq_cap, 2).bit_length() - 1)
+                seq_new = max(2, min(seq_pow2, seq_cap))
+                if seq_new < args.seq_len:
+                    print(
+                        "hardware-aware: reducing seq_len "
+                        f"{args.seq_len} -> {seq_new} "
+                        f"(max_logits_elements={resolved_max_logits_elements}, "
+                        f"max_attention_elements={resolved_max_attention_elements})"
+                    )
+                    args.seq_len = seq_new
 
     if args.batch_size % args.grad_accum_steps != 0:
         raise ValueError("--batch-size must be divisible by --grad-accum-steps")
@@ -1420,6 +1469,7 @@ def run(args: argparse.Namespace) -> None:
                     f"step_record_interval={args.step_record_interval}, "
                     f"batch_size={runtime_batch_size}, "
                     f"grad_accum_steps={runtime_grad_accum_steps}, "
+                    f"seq_len={args.seq_len}, "
                     f"lr={args.lr:.6g}, lr_schedule={args.lr_schedule}, "
                     f"lr_warmup_steps={args.lr_warmup_steps}, "
                     f"lr_min_ratio={args.lr_min_ratio:.4f}, "
@@ -1829,7 +1879,9 @@ def run(args: argparse.Namespace) -> None:
         "detected_device_kind": detected_device_kind,
         "max_tokens_per_step": resolved_max_tokens_per_step,
         "max_logits_elements": resolved_max_logits_elements,
+        "max_attention_elements": resolved_max_attention_elements,
         "requested_batch_size": requested_batch_size,
+        "requested_seq_len": requested_seq_len,
         "requested_grad_accum_steps": requested_grad_accum_steps,
         "batch_size": args.batch_size,
         "steps": args.steps,
@@ -1844,6 +1896,7 @@ def run(args: argparse.Namespace) -> None:
         "configs": [c.name for c in configs],
         "warmup_steps": args.warmup_steps,
         "compile_retry_attempts": args.compile_retry_attempts,
+        "auto_seq_len_by_memory": args.auto_seq_len_by_memory,
         "lr": args.lr,
         "lr_schedule": args.lr_schedule,
         "lr_warmup_steps": args.lr_warmup_steps,
@@ -1908,6 +1961,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--max-tokens-per-step", type=int, default=None)
     p.add_argument("--max-logits-elements", type=int, default=None)
+    p.add_argument("--max-attention-elements", type=int, default=None)
+    p.add_argument(
+        "--auto-seq-len-by-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     p.add_argument(
         "--auto-token-pool-by-host-ram",
         action=argparse.BooleanOptionalAction,
