@@ -49,7 +49,8 @@ python scripts/run_benchmarks.py \
   --dataset-train-split train \
   --dataset-eval-split train \
   --hardware-aware \
-  --max-tokens-per-step 8192 \
+  --max-tokens-per-step 4096 \
+  --compile-retry-attempts 3 \
   --auto-token-pool-by-host-ram \
   --host-ram-token-pool-fraction 0.20 \
   --dataset-http-cache-dir artifacts/datasets/hf_http_cache \

@@ -602,6 +602,20 @@ def _available_host_ram_bytes() -> Optional[int]:
     return None
 
 
+def _is_probable_compile_oom(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    needles = (
+        "resource_exhausted",
+        "out of memory",
+        "oom",
+        "failed to allocate",
+        "compilation",
+        "compile",
+        "hlo",
+    )
+    return any(n in msg for n in needles)
+
+
 def _make_token_batches(
     key: jax.Array,
     *,
@@ -1048,6 +1062,8 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--log-interval must be >= 0")
     if args.step_record_interval < 1:
         raise ValueError("--step-record-interval must be >= 1")
+    if args.compile_retry_attempts < 0:
+        raise ValueError("--compile-retry-attempts must be >= 0")
     if args.steps < 1:
         raise ValueError("--steps must be >= 1")
     if args.token_pool_batches < 1:
@@ -1351,68 +1367,123 @@ def run(args: argparse.Namespace) -> None:
     summary_rows: List[Dict[str, Any]] = []
     try:
         for cfg in configs:
-            print(
-                f"Starting config={cfg.name} "
-                f"(eval_interval={args.eval_interval}, log_interval={args.log_interval}, "
-                f"step_record_interval={args.step_record_interval}, "
-                f"batch_size={args.batch_size}, grad_accum_steps={args.grad_accum_steps}, "
-                f"lr={args.lr:.6g}, lr_schedule={args.lr_schedule}, "
-                f"lr_warmup_steps={args.lr_warmup_steps}, lr_min_ratio={args.lr_min_ratio:.4f}, "
-                f"lr_total_steps={lr_total_steps})"
-            )
-            print("  - init: copying params and building optimizer...")
-            params = jax.tree.map(lambda z: jnp.array(z, copy=True), init_params)
-            tx = _build_optimizer(
-                cfg,
-                params=params,
-                learning_rate=lr_fn,
-                wd=args.weight_decay,
-                grad_clip_norm=args.grad_clip_norm,
-            )
-            opt_init_t0 = time.perf_counter()
-            opt_state = tx.init(params)
-            print(f"  - init: optimizer state ready in {(time.perf_counter() - opt_init_t0):.2f}s")
-
-            print("  - jit: creating step/eval functions...")
-            step_fn = _make_step_fn(
-                tx=tx,
-                teacher_params=teacher_params,
-                lora_hook_on=cfg.lora_hook_on,
-                model_cfg=model_cfg,
-                objective_cfg=objective_cfg,
-                grad_accum_steps=args.grad_accum_steps,
-                causal_mask=mask,
-            )
-            eval_fn = _make_eval_fn(
-                teacher_params=teacher_params,
-                model_cfg=model_cfg,
-                objective_cfg=objective_cfg,
-                causal_mask=mask,
-            )
-            print("  - jit: functions created")
-
-            # JIT warmup (excluded from timing rows).
-            if args.warmup_steps > 0:
+            runtime_batch_size = args.batch_size
+            runtime_grad_accum_steps = args.grad_accum_steps
+            attempt = 0
+            while True:
                 print(
-                    f"  - warmup: running {args.warmup_steps} step(s); "
-                    "step 1 triggers XLA compile and may take several minutes on TPU."
+                    f"Starting config={cfg.name} "
+                    f"(attempt={attempt + 1}/{args.compile_retry_attempts + 1}, "
+                    f"eval_interval={args.eval_interval}, log_interval={args.log_interval}, "
+                    f"step_record_interval={args.step_record_interval}, "
+                    f"batch_size={runtime_batch_size}, "
+                    f"grad_accum_steps={runtime_grad_accum_steps}, "
+                    f"lr={args.lr:.6g}, lr_schedule={args.lr_schedule}, "
+                    f"lr_warmup_steps={args.lr_warmup_steps}, "
+                    f"lr_min_ratio={args.lr_min_ratio:.4f}, "
+                    f"lr_total_steps={lr_total_steps})"
                 )
-            for i in range(args.warmup_steps):
-                warm_step_t0 = time.perf_counter()
-                params, opt_state, loss_val, ce_val, kl_val, grad_norm, update_norm = step_fn(
-                    params, opt_state, train_tokens[i]
+                print("  - init: copying params and building optimizer...")
+                params = jax.tree.map(lambda z: jnp.array(z, copy=True), init_params)
+                tx = _build_optimizer(
+                    cfg,
+                    params=params,
+                    learning_rate=lr_fn,
+                    wd=args.weight_decay,
+                    grad_clip_norm=args.grad_clip_norm,
                 )
-                jax.block_until_ready(loss_val)
-                jax.block_until_ready(ce_val)
-                jax.block_until_ready(kl_val)
-                jax.block_until_ready(grad_norm)
-                jax.block_until_ready(update_norm)
-                warm_step_s = time.perf_counter() - warm_step_t0
-                if i == 0:
-                    print(f"  - warmup: step 1 compile+execute complete in {warm_step_s:.2f}s")
-                elif i + 1 == args.warmup_steps:
-                    print(f"  - warmup: final step complete in {warm_step_s:.2f}s")
+                opt_init_t0 = time.perf_counter()
+                opt_state = tx.init(params)
+                print(
+                    f"  - init: optimizer state ready in {(time.perf_counter() - opt_init_t0):.2f}s"
+                )
 
+                print("  - jit: creating step/eval functions...")
+                step_fn = _make_step_fn(
+                    tx=tx,
+                    teacher_params=teacher_params,
+                    lora_hook_on=cfg.lora_hook_on,
+                    model_cfg=model_cfg,
+                    objective_cfg=objective_cfg,
+                    grad_accum_steps=runtime_grad_accum_steps,
+                    causal_mask=mask,
+                )
+                eval_fn = _make_eval_fn(
+                    teacher_params=teacher_params,
+                    model_cfg=model_cfg,
+                    objective_cfg=objective_cfg,
+                    causal_mask=mask,
+                )
+                print("  - jit: functions created")
+
+                # JIT warmup (excluded from timing rows).
+                try:
+                    if args.warmup_steps > 0:
+                        print(
+                            f"  - warmup: running {args.warmup_steps} step(s); "
+                            "step 1 triggers XLA compile and may take several minutes on TPU."
+                        )
+                    for i in range(args.warmup_steps):
+                        warm_step_t0 = time.perf_counter()
+                        (
+                            params,
+                            opt_state,
+                            loss_val,
+                            ce_val,
+                            kl_val,
+                            grad_norm,
+                            update_norm,
+                        ) = step_fn(
+                            params,
+                            opt_state,
+                            train_tokens[i, :runtime_batch_size, :],
+                        )
+                        jax.block_until_ready(loss_val)
+                        jax.block_until_ready(ce_val)
+                        jax.block_until_ready(kl_val)
+                        jax.block_until_ready(grad_norm)
+                        jax.block_until_ready(update_norm)
+                        warm_step_s = time.perf_counter() - warm_step_t0
+                        if i == 0:
+                            print(
+                                f"  - warmup: step 1 compile+execute complete in {warm_step_s:.2f}s"
+                            )
+                        elif i + 1 == args.warmup_steps:
+                            print(f"  - warmup: final step complete in {warm_step_s:.2f}s")
+                    break
+                except Exception as exc:
+                    can_retry = (
+                        args.hardware_aware
+                        and _is_probable_compile_oom(exc)
+                        and attempt < args.compile_retry_attempts
+                        and runtime_batch_size > 1
+                    )
+                    if not can_retry:
+                        raise
+
+                    prev_batch = runtime_batch_size
+                    prev_grad_accum = runtime_grad_accum_steps
+                    runtime_grad_accum_steps = 1
+                    runtime_batch_size = max(runtime_batch_size // 2, 1)
+                    if (
+                        runtime_batch_size == prev_batch
+                        and runtime_grad_accum_steps == prev_grad_accum
+                    ):
+                        raise
+                    attempt += 1
+                    print(
+                        "  - warmup: compile OOM detected; retrying with "
+                        f"batch_size={runtime_batch_size}, "
+                        f"grad_accum_steps={runtime_grad_accum_steps}"
+                    )
+
+            tokens_per_step_cfg = runtime_batch_size * args.seq_len
+            target_token_steps_cfg = 0
+            if args.target_train_tokens is not None:
+                target_token_steps_cfg = math.ceil(
+                    args.target_train_tokens / float(tokens_per_step_cfg)
+                )
+            min_steps_cfg = max(args.steps, target_token_steps_cfg)
             target_seconds = args.target_runtime_minutes * 60.0
             max_steps = args.max_steps
             run_t0 = time.perf_counter()
@@ -1435,7 +1506,7 @@ def run(args: argparse.Namespace) -> None:
             while True:
                 step = step_count
                 token_idx = (args.warmup_steps + step) % train_pool_batches
-                tokens = train_tokens[token_idx]
+                tokens = train_tokens[token_idx, :runtime_batch_size, :]
                 t0 = time.perf_counter()
                 params, opt_state, loss_val, ce_val, kl_val, grad_norm, update_norm = step_fn(
                     params, opt_state, tokens
@@ -1446,7 +1517,7 @@ def run(args: argparse.Namespace) -> None:
                 jax.block_until_ready(grad_norm)
                 jax.block_until_ready(update_norm)
                 step_ms = (time.perf_counter() - t0) * 1000.0
-                tokens_per_s = (args.batch_size * args.seq_len) / max(step_ms / 1000.0, 1e-9)
+                tokens_per_s = (runtime_batch_size * args.seq_len) / max(step_ms / 1000.0, 1e-9)
 
                 loss_scalar = float(loss_val)
                 ce_scalar = float(ce_val)
@@ -1467,7 +1538,9 @@ def run(args: argparse.Namespace) -> None:
                     eval_ce_acc = 0.0
                     eval_kl_acc = 0.0
                     for eval_idx in range(args.eval_batches):
-                        loss_eval, ce_eval, kl_eval = eval_fn(params, eval_tokens[eval_idx])
+                        loss_eval, ce_eval, kl_eval = eval_fn(
+                            params, eval_tokens[eval_idx, :runtime_batch_size, :]
+                        )
                         loss_eval = float(jax.block_until_ready(loss_eval))
                         ce_eval = float(jax.block_until_ready(ce_eval))
                         kl_eval = float(jax.block_until_ready(kl_eval))
@@ -1526,10 +1599,10 @@ def run(args: argparse.Namespace) -> None:
                 learning_rate_last = learning_rate_scalar
                 hb_last = hb_metrics
                 step_count += 1
-                tokens_processed += tokens_per_step
+                tokens_processed += tokens_per_step_cfg
 
                 elapsed = time.perf_counter() - run_t0
-                reached_min_steps = step_count >= min_steps
+                reached_min_steps = step_count >= min_steps_cfg
                 reached_target_runtime = elapsed >= target_seconds if target_seconds > 0 else True
                 reached_max_steps = (max_steps is not None) and (step_count >= max_steps)
                 reached_token_target = (
@@ -1549,7 +1622,7 @@ def run(args: argparse.Namespace) -> None:
                     avg_toks_per_s = tokens_per_s_total / max(step_count, 1)
                     runtime_min = elapsed / 60.0
                     eta_by_steps_min = (
-                        max(min_steps - step_count, 0) * avg_step_ms / 60000.0
+                        max(min_steps_cfg - step_count, 0) * avg_step_ms / 60000.0
                     )
                     eta_by_runtime_min = (
                         max(target_seconds - elapsed, 0.0) / 60.0 if target_seconds > 0 else 0.0
@@ -1602,7 +1675,7 @@ def run(args: argparse.Namespace) -> None:
                 ):
                     warn_parts = [f"max_steps={max_steps} reached early:"]
                     if not reached_min_steps:
-                        warn_parts.append(f"min_steps={min_steps} not met")
+                        warn_parts.append(f"min_steps={min_steps_cfg} not met")
                     if not reached_target_runtime:
                         warn_parts.append(
                             f"target_runtime_minutes={args.target_runtime_minutes:.2f} not met"
@@ -1623,7 +1696,9 @@ def run(args: argparse.Namespace) -> None:
         eval_ce_acc = 0.0
         eval_kl_acc = 0.0
         for eval_idx in range(args.eval_batches):
-            loss_eval, ce_eval, kl_eval = eval_fn(params, eval_tokens[eval_idx])
+            loss_eval, ce_eval, kl_eval = eval_fn(
+                params, eval_tokens[eval_idx, :runtime_batch_size, :]
+            )
             loss_eval = float(jax.block_until_ready(loss_eval))
             ce_eval = float(jax.block_until_ready(ce_eval))
             kl_eval = float(jax.block_until_ready(kl_eval))
@@ -1639,6 +1714,9 @@ def run(args: argparse.Namespace) -> None:
                 "hyperball_on": int(cfg.hyperball_on),
                 "grouped": int(cfg.grouped),
                 "lora_hook_on": int(cfg.lora_hook_on),
+                "effective_batch_size": runtime_batch_size,
+                "effective_grad_accum_steps": runtime_grad_accum_steps,
+                "effective_tokens_per_step": tokens_per_step_cfg,
                 "steps": step_count,
                 "requested_min_steps": args.steps,
                 "target_runtime_minutes": f"{args.target_runtime_minutes:.2f}",
@@ -1677,6 +1755,9 @@ def run(args: argparse.Namespace) -> None:
             "hyperball_on",
             "grouped",
             "lora_hook_on",
+            "effective_batch_size",
+            "effective_grad_accum_steps",
+            "effective_tokens_per_step",
             "steps",
             "requested_min_steps",
             "target_runtime_minutes",
@@ -1719,6 +1800,7 @@ def run(args: argparse.Namespace) -> None:
         "target_token_steps": target_token_steps,
         "configs": [c.name for c in configs],
         "warmup_steps": args.warmup_steps,
+        "compile_retry_attempts": args.compile_retry_attempts,
         "lr": args.lr,
         "lr_schedule": args.lr_schedule,
         "lr_warmup_steps": args.lr_warmup_steps,
@@ -1807,6 +1889,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--eval-batches", type=int, default=2)
     p.add_argument("--log-interval", type=int, default=10)
     p.add_argument("--step-record-interval", type=int, default=1)
+    p.add_argument("--compile-retry-attempts", type=int, default=2)
     p.add_argument("--shift-start-frac", type=float, default=0.5)
     p.add_argument("--train-rare-token-prob", type=float, default=0.03)
     p.add_argument("--eval-rare-token-prob", type=float, default=0.08)
