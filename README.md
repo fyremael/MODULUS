@@ -62,6 +62,8 @@ send `Authorization: Bearer ...` to dataset-server.
 If rate-limited, increase `--dataset-http-max-retries` and
 `--dataset-http-min-interval-sec`.
 Use `--log-interval` (for example `10`) to print rich live progress lines.
+For long runs, increase `--step-record-interval` (for example `10` or `25`) to
+reduce memory and CSV size while preserving eval snapshots.
 For `hf_stream` mode, set `HF_HOME` / `HF_DATASETS_CACHE` to a persistent path
 to reuse downloaded shards across reruns.
 

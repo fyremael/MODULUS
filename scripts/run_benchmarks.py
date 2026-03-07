@@ -1013,6 +1013,8 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--eval-batches must be >= 1")
     if args.log_interval < 0:
         raise ValueError("--log-interval must be >= 0")
+    if args.step_record_interval < 1:
+        raise ValueError("--step-record-interval must be >= 1")
     if args.steps < 1:
         raise ValueError("--steps must be >= 1")
     if args.token_pool_batches < 1:
@@ -1227,247 +1229,284 @@ def run(args: argparse.Namespace) -> None:
             else:
                 raise
 
-    step_rows: List[Dict[str, Any]] = []
+    step_csv = out_dir / "benchmark_steps.csv"
+    summary_csv = out_dir / "benchmark_summary.csv"
+    meta_json = out_dir / "run_meta.json"
+
+    step_fieldnames = [
+        "config",
+        "hyperball_on",
+        "grouped",
+        "lora_hook_on",
+        "step",
+        "loss",
+        "next_token_ce",
+        "distill_kl",
+        "step_ms",
+        "tokens_per_s",
+        "grad_norm",
+        "update_norm",
+        "learning_rate",
+        "eval_loss",
+        "eval_next_token_ce",
+        "eval_distill_kl",
+        "hyperball_angle_mean",
+        "hyperball_radial_frac_mean",
+    ]
+    step_file = step_csv.open("w", newline="", encoding="utf-8")
+    step_writer = csv.DictWriter(step_file, fieldnames=step_fieldnames)
+    step_writer.writeheader()
     summary_rows: List[Dict[str, Any]] = []
-
-    for cfg in configs:
-        print(
-            f"Starting config={cfg.name} "
-            f"(eval_interval={args.eval_interval}, log_interval={args.log_interval}, "
-            f"lr={args.lr:.6g}, lr_schedule={args.lr_schedule}, "
-            f"lr_warmup_steps={args.lr_warmup_steps}, lr_min_ratio={args.lr_min_ratio:.4f}, "
-            f"lr_total_steps={lr_total_steps})"
-        )
-        params = jax.tree.map(lambda z: jnp.array(z, copy=True), init_params)
-        tx = _build_optimizer(
-            cfg,
-            params=params,
-            learning_rate=lr_fn,
-            wd=args.weight_decay,
-            grad_clip_norm=args.grad_clip_norm,
-        )
-        opt_state = tx.init(params)
-        step_fn = _make_step_fn(
-            tx=tx,
-            teacher_params=teacher_params,
-            lora_hook_on=cfg.lora_hook_on,
-            model_cfg=model_cfg,
-            objective_cfg=objective_cfg,
-            grad_accum_steps=args.grad_accum_steps,
-            causal_mask=mask,
-        )
-        eval_fn = _make_eval_fn(
-            teacher_params=teacher_params,
-            model_cfg=model_cfg,
-            objective_cfg=objective_cfg,
-            causal_mask=mask,
-        )
-
-        # JIT warmup (excluded from timing rows).
-        for i in range(args.warmup_steps):
-            params, opt_state, loss_val, ce_val, kl_val, grad_norm, update_norm = step_fn(
-                params, opt_state, train_tokens[i]
+    try:
+        for cfg in configs:
+            print(
+                f"Starting config={cfg.name} "
+                f"(eval_interval={args.eval_interval}, log_interval={args.log_interval}, "
+                f"step_record_interval={args.step_record_interval}, "
+                f"lr={args.lr:.6g}, lr_schedule={args.lr_schedule}, "
+                f"lr_warmup_steps={args.lr_warmup_steps}, lr_min_ratio={args.lr_min_ratio:.4f}, "
+                f"lr_total_steps={lr_total_steps})"
             )
-            jax.block_until_ready(loss_val)
-            jax.block_until_ready(ce_val)
-            jax.block_until_ready(kl_val)
-            jax.block_until_ready(grad_norm)
-            jax.block_until_ready(update_norm)
-
-        target_seconds = args.target_runtime_minutes * 60.0
-        max_steps = args.max_steps
-        run_t0 = time.perf_counter()
-
-        loss_last = float("nan")
-        ce_last = float("nan")
-        kl_last = float("nan")
-        best_eval_loss = float("inf")
-        final_eval_loss = float("nan")
-        step_ms_total = 0.0
-        tokens_per_s_total = 0.0
-        grad_norm_total = 0.0
-        update_norm_total = 0.0
-        learning_rate_total = 0.0
-        learning_rate_last = float("nan")
-        hb_last: Dict[str, float] = {}
-        step_count = 0
-        tokens_processed = 0
-
-        while True:
-            step = step_count
-            token_idx = (args.warmup_steps + step) % train_pool_batches
-            tokens = train_tokens[token_idx]
-            t0 = time.perf_counter()
-            params, opt_state, loss_val, ce_val, kl_val, grad_norm, update_norm = step_fn(
-                params, opt_state, tokens
+            params = jax.tree.map(lambda z: jnp.array(z, copy=True), init_params)
+            tx = _build_optimizer(
+                cfg,
+                params=params,
+                learning_rate=lr_fn,
+                wd=args.weight_decay,
+                grad_clip_norm=args.grad_clip_norm,
             )
-            jax.block_until_ready(loss_val)
-            jax.block_until_ready(ce_val)
-            jax.block_until_ready(kl_val)
-            jax.block_until_ready(grad_norm)
-            jax.block_until_ready(update_norm)
-            step_ms = (time.perf_counter() - t0) * 1000.0
-            tokens_per_s = (args.batch_size * args.seq_len) / max(step_ms / 1000.0, 1e-9)
-
-            loss_scalar = float(loss_val)
-            ce_scalar = float(ce_val)
-            kl_scalar = float(kl_val)
-            grad_norm_scalar = float(grad_norm)
-            update_norm_scalar = float(update_norm)
-            learning_rate_scalar = float(jnp.asarray(lr_fn(step)))
-            hb_metrics = _aggregate_hyperball_metrics(opt_state)
-
-            eval_loss = float("nan")
-            eval_ce = float("nan")
-            eval_kl = float("nan")
-            should_eval = args.eval_interval > 0 and (
-                (step + 1) % args.eval_interval == 0 or step == (args.steps - 1)
+            opt_state = tx.init(params)
+            step_fn = _make_step_fn(
+                tx=tx,
+                teacher_params=teacher_params,
+                lora_hook_on=cfg.lora_hook_on,
+                model_cfg=model_cfg,
+                objective_cfg=objective_cfg,
+                grad_accum_steps=args.grad_accum_steps,
+                causal_mask=mask,
             )
-            if should_eval:
-                eval_loss_acc = 0.0
-                eval_ce_acc = 0.0
-                eval_kl_acc = 0.0
-                for eval_idx in range(args.eval_batches):
-                    loss_eval, ce_eval, kl_eval = eval_fn(params, eval_tokens[eval_idx])
-                    loss_eval = float(jax.block_until_ready(loss_eval))
-                    ce_eval = float(jax.block_until_ready(ce_eval))
-                    kl_eval = float(jax.block_until_ready(kl_eval))
-                    eval_loss_acc += loss_eval
-                    eval_ce_acc += ce_eval
-                    eval_kl_acc += kl_eval
-                eval_loss = eval_loss_acc / float(args.eval_batches)
-                eval_ce = eval_ce_acc / float(args.eval_batches)
-                eval_kl = eval_kl_acc / float(args.eval_batches)
-                final_eval_loss = eval_loss
-                best_eval_loss = min(best_eval_loss, eval_loss)
-
-            row = {
-                "config": cfg.name,
-                "hyperball_on": int(cfg.hyperball_on),
-                "grouped": int(cfg.grouped),
-                "lora_hook_on": int(cfg.lora_hook_on),
-                "step": step,
-                "loss": f"{loss_scalar:.8f}",
-                "next_token_ce": f"{ce_scalar:.8f}",
-                "distill_kl": f"{kl_scalar:.8f}",
-                "step_ms": f"{step_ms:.4f}",
-                "tokens_per_s": f"{tokens_per_s:.2f}",
-                "grad_norm": f"{grad_norm_scalar:.8f}",
-                "update_norm": f"{update_norm_scalar:.8f}",
-                "learning_rate": f"{learning_rate_scalar:.10f}",
-                "eval_loss": f"{eval_loss:.8f}",
-                "eval_next_token_ce": f"{eval_ce:.8f}",
-                "eval_distill_kl": f"{eval_kl:.8f}",
-                "hyperball_angle_mean": (
-                    f"{hb_metrics.get('hyperball/angle_mean', float('nan')):.8f}"
-                ),
-                "hyperball_radial_frac_mean": (
-                    f"{hb_metrics.get('hyperball/radial_frac_mean', float('nan')):.8f}"
-                ),
-            }
-            step_rows.append(row)
-
-            loss_last = loss_scalar
-            ce_last = ce_scalar
-            kl_last = kl_scalar
-            step_ms_total += step_ms
-            tokens_per_s_total += tokens_per_s
-            grad_norm_total += grad_norm_scalar
-            update_norm_total += update_norm_scalar
-            learning_rate_total += learning_rate_scalar
-            learning_rate_last = learning_rate_scalar
-            hb_last = hb_metrics
-            step_count += 1
-            tokens_processed += tokens_per_step
-
-            elapsed = time.perf_counter() - run_t0
-            reached_min_steps = step_count >= min_steps
-            reached_target_runtime = elapsed >= target_seconds if target_seconds > 0 else True
-            reached_max_steps = (max_steps is not None) and (step_count >= max_steps)
-            reached_token_target = (
-                (args.target_train_tokens is None) or (tokens_processed >= args.target_train_tokens)
+            eval_fn = _make_eval_fn(
+                teacher_params=teacher_params,
+                model_cfg=model_cfg,
+                objective_cfg=objective_cfg,
+                causal_mask=mask,
             )
 
-            should_log = False
-            if args.log_interval > 0 and (step_count % args.log_interval == 0):
-                should_log = True
-            if should_eval:
-                should_log = True
-            if step_count == 1:
-                should_log = True
-            if should_log:
-                avg_step_ms = step_ms_total / max(step_count, 1)
-                avg_toks_per_s = tokens_per_s_total / max(step_count, 1)
-                runtime_min = elapsed / 60.0
-                eta_by_steps_min = (
-                    max(min_steps - step_count, 0) * avg_step_ms / 60000.0
+            # JIT warmup (excluded from timing rows).
+            for i in range(args.warmup_steps):
+                params, opt_state, loss_val, ce_val, kl_val, grad_norm, update_norm = step_fn(
+                    params, opt_state, train_tokens[i]
                 )
-                eta_by_runtime_min = (
-                    max(target_seconds - elapsed, 0.0) / 60.0 if target_seconds > 0 else 0.0
+                jax.block_until_ready(loss_val)
+                jax.block_until_ready(ce_val)
+                jax.block_until_ready(kl_val)
+                jax.block_until_ready(grad_norm)
+                jax.block_until_ready(update_norm)
+
+            target_seconds = args.target_runtime_minutes * 60.0
+            max_steps = args.max_steps
+            run_t0 = time.perf_counter()
+
+            loss_last = float("nan")
+            ce_last = float("nan")
+            kl_last = float("nan")
+            best_eval_loss = float("inf")
+            final_eval_loss = float("nan")
+            step_ms_total = 0.0
+            tokens_per_s_total = 0.0
+            grad_norm_total = 0.0
+            update_norm_total = 0.0
+            learning_rate_total = 0.0
+            learning_rate_last = float("nan")
+            hb_last: Dict[str, float] = {}
+            step_count = 0
+            tokens_processed = 0
+
+            while True:
+                step = step_count
+                token_idx = (args.warmup_steps + step) % train_pool_batches
+                tokens = train_tokens[token_idx]
+                t0 = time.perf_counter()
+                params, opt_state, loss_val, ce_val, kl_val, grad_norm, update_norm = step_fn(
+                    params, opt_state, tokens
                 )
-                eta_by_tokens_min = (
-                    (
-                        max(args.target_train_tokens - tokens_processed, 0)
-                        / max(avg_toks_per_s, 1e-9)
-                    )
-                    / 60.0
-                    if args.target_train_tokens is not None
-                    else 0.0
+                jax.block_until_ready(loss_val)
+                jax.block_until_ready(ce_val)
+                jax.block_until_ready(kl_val)
+                jax.block_until_ready(grad_norm)
+                jax.block_until_ready(update_norm)
+                step_ms = (time.perf_counter() - t0) * 1000.0
+                tokens_per_s = (args.batch_size * args.seq_len) / max(step_ms / 1000.0, 1e-9)
+
+                loss_scalar = float(loss_val)
+                ce_scalar = float(ce_val)
+                kl_scalar = float(kl_val)
+                grad_norm_scalar = float(grad_norm)
+                update_norm_scalar = float(update_norm)
+                learning_rate_scalar = float(jnp.asarray(lr_fn(step)))
+                hb_metrics = _aggregate_hyperball_metrics(opt_state)
+
+                eval_loss = float("nan")
+                eval_ce = float("nan")
+                eval_kl = float("nan")
+                should_eval = args.eval_interval > 0 and (
+                    (step + 1) % args.eval_interval == 0 or step == (args.steps - 1)
                 )
-                eta_min = max(eta_by_steps_min, eta_by_runtime_min, eta_by_tokens_min)
-                progress_parts = [
-                    f"[{cfg.name}]",
-                    f"step={step_count}",
-                    f"elapsed_min={runtime_min:.2f}",
-                    f"eta_min={eta_min:.2f}",
-                    f"train_loss={_fmt_metric(loss_scalar, 6)}",
-                    f"train_ce={_fmt_metric(ce_scalar, 6)}",
-                    f"train_kl={_fmt_metric(kl_scalar, 6)}",
-                    f"avg_step_ms={_fmt_metric(avg_step_ms, 2)}",
-                    f"avg_tok_s={_fmt_metric(avg_toks_per_s, 2)}",
-                    f"grad_norm={_fmt_metric(grad_norm_scalar, 6)}",
-                    f"update_norm={_fmt_metric(update_norm_scalar, 6)}",
-                    f"lr={_fmt_metric(learning_rate_scalar, 8)}",
-                ]
-                if args.target_train_tokens is not None:
-                    progress_parts.append(
-                        f"tokens={tokens_processed}/{args.target_train_tokens}"
-                    )
                 if should_eval:
-                    progress_parts.append(f"val_loss={_fmt_metric(eval_loss, 6)}")
-                    progress_parts.append(f"val_ce={_fmt_metric(eval_ce, 6)}")
-                    progress_parts.append(f"val_kl={_fmt_metric(eval_kl, 6)}")
-                    progress_parts.append(f"best_val={_fmt_metric(best_eval_loss, 6)}")
-                angle = hb_metrics.get("hyperball/angle_mean", float("nan"))
-                radial = hb_metrics.get("hyperball/radial_frac_mean", float("nan"))
-                if not math.isnan(angle):
-                    progress_parts.append(f"hb_angle={_fmt_metric(angle, 6)}")
-                if not math.isnan(radial):
-                    progress_parts.append(f"hb_radial={_fmt_metric(radial, 6)}")
-                print(" | ".join(progress_parts))
+                    eval_loss_acc = 0.0
+                    eval_ce_acc = 0.0
+                    eval_kl_acc = 0.0
+                    for eval_idx in range(args.eval_batches):
+                        loss_eval, ce_eval, kl_eval = eval_fn(params, eval_tokens[eval_idx])
+                        loss_eval = float(jax.block_until_ready(loss_eval))
+                        ce_eval = float(jax.block_until_ready(ce_eval))
+                        kl_eval = float(jax.block_until_ready(kl_eval))
+                        eval_loss_acc += loss_eval
+                        eval_ce_acc += ce_eval
+                        eval_kl_acc += kl_eval
+                    eval_loss = eval_loss_acc / float(args.eval_batches)
+                    eval_ce = eval_ce_acc / float(args.eval_batches)
+                    eval_kl = eval_kl_acc / float(args.eval_batches)
+                    final_eval_loss = eval_loss
+                    best_eval_loss = min(best_eval_loss, eval_loss)
 
-            if reached_max_steps and (
-                (not reached_target_runtime)
-                or (not reached_token_target)
-                or (not reached_min_steps)
-            ):
-                warn_parts = [f"max_steps={max_steps} reached early:"]
-                if not reached_min_steps:
-                    warn_parts.append(f"min_steps={min_steps} not met")
-                if not reached_target_runtime:
-                    warn_parts.append(
-                        f"target_runtime_minutes={args.target_runtime_minutes:.2f} not met"
+                row = {
+                    "config": cfg.name,
+                    "hyperball_on": int(cfg.hyperball_on),
+                    "grouped": int(cfg.grouped),
+                    "lora_hook_on": int(cfg.lora_hook_on),
+                    "step": step,
+                    "loss": f"{loss_scalar:.8f}",
+                    "next_token_ce": f"{ce_scalar:.8f}",
+                    "distill_kl": f"{kl_scalar:.8f}",
+                    "step_ms": f"{step_ms:.4f}",
+                    "tokens_per_s": f"{tokens_per_s:.2f}",
+                    "grad_norm": f"{grad_norm_scalar:.8f}",
+                    "update_norm": f"{update_norm_scalar:.8f}",
+                    "learning_rate": f"{learning_rate_scalar:.10f}",
+                    "eval_loss": f"{eval_loss:.8f}",
+                    "eval_next_token_ce": f"{eval_ce:.8f}",
+                    "eval_distill_kl": f"{eval_kl:.8f}",
+                    "hyperball_angle_mean": (
+                        f"{hb_metrics.get('hyperball/angle_mean', float('nan')):.8f}"
+                    ),
+                    "hyperball_radial_frac_mean": (
+                        f"{hb_metrics.get('hyperball/radial_frac_mean', float('nan')):.8f}"
+                    ),
+                }
+                should_record_step = (
+                    args.step_record_interval <= 1
+                    or (step_count % args.step_record_interval == 0)
+                    or should_eval
+                    or step_count == 0
+                )
+                if should_record_step:
+                    step_writer.writerow(row)
+                    if step_count % 200 == 0:
+                        step_file.flush()
+
+                loss_last = loss_scalar
+                ce_last = ce_scalar
+                kl_last = kl_scalar
+                step_ms_total += step_ms
+                tokens_per_s_total += tokens_per_s
+                grad_norm_total += grad_norm_scalar
+                update_norm_total += update_norm_scalar
+                learning_rate_total += learning_rate_scalar
+                learning_rate_last = learning_rate_scalar
+                hb_last = hb_metrics
+                step_count += 1
+                tokens_processed += tokens_per_step
+
+                elapsed = time.perf_counter() - run_t0
+                reached_min_steps = step_count >= min_steps
+                reached_target_runtime = elapsed >= target_seconds if target_seconds > 0 else True
+                reached_max_steps = (max_steps is not None) and (step_count >= max_steps)
+                reached_token_target = (
+                    (args.target_train_tokens is None)
+                    or (tokens_processed >= args.target_train_tokens)
+                )
+
+                should_log = False
+                if args.log_interval > 0 and (step_count % args.log_interval == 0):
+                    should_log = True
+                if should_eval:
+                    should_log = True
+                if step_count == 1:
+                    should_log = True
+                if should_log:
+                    avg_step_ms = step_ms_total / max(step_count, 1)
+                    avg_toks_per_s = tokens_per_s_total / max(step_count, 1)
+                    runtime_min = elapsed / 60.0
+                    eta_by_steps_min = (
+                        max(min_steps - step_count, 0) * avg_step_ms / 60000.0
                     )
-                if not reached_token_target and args.target_train_tokens is not None:
-                    warn_parts.append(
-                        f"target_train_tokens={args.target_train_tokens} not met"
+                    eta_by_runtime_min = (
+                        max(target_seconds - elapsed, 0.0) / 60.0 if target_seconds > 0 else 0.0
                     )
-                print("WARNING: " + "; ".join(warn_parts))
-                break
-            if reached_min_steps and reached_target_runtime and reached_token_target:
-                break
-            if reached_max_steps:
-                break
+                    eta_by_tokens_min = (
+                        (
+                            max(args.target_train_tokens - tokens_processed, 0)
+                            / max(avg_toks_per_s, 1e-9)
+                        )
+                        / 60.0
+                        if args.target_train_tokens is not None
+                        else 0.0
+                    )
+                    eta_min = max(eta_by_steps_min, eta_by_runtime_min, eta_by_tokens_min)
+                    progress_parts = [
+                        f"[{cfg.name}]",
+                        f"step={step_count}",
+                        f"elapsed_min={runtime_min:.2f}",
+                        f"eta_min={eta_min:.2f}",
+                        f"train_loss={_fmt_metric(loss_scalar, 6)}",
+                        f"train_ce={_fmt_metric(ce_scalar, 6)}",
+                        f"train_kl={_fmt_metric(kl_scalar, 6)}",
+                        f"avg_step_ms={_fmt_metric(avg_step_ms, 2)}",
+                        f"avg_tok_s={_fmt_metric(avg_toks_per_s, 2)}",
+                        f"grad_norm={_fmt_metric(grad_norm_scalar, 6)}",
+                        f"update_norm={_fmt_metric(update_norm_scalar, 6)}",
+                        f"lr={_fmt_metric(learning_rate_scalar, 8)}",
+                    ]
+                    if args.target_train_tokens is not None:
+                        progress_parts.append(
+                            f"tokens={tokens_processed}/{args.target_train_tokens}"
+                        )
+                    if should_eval:
+                        progress_parts.append(f"val_loss={_fmt_metric(eval_loss, 6)}")
+                        progress_parts.append(f"val_ce={_fmt_metric(eval_ce, 6)}")
+                        progress_parts.append(f"val_kl={_fmt_metric(eval_kl, 6)}")
+                        progress_parts.append(f"best_val={_fmt_metric(best_eval_loss, 6)}")
+                    angle = hb_metrics.get("hyperball/angle_mean", float("nan"))
+                    radial = hb_metrics.get("hyperball/radial_frac_mean", float("nan"))
+                    if not math.isnan(angle):
+                        progress_parts.append(f"hb_angle={_fmt_metric(angle, 6)}")
+                    if not math.isnan(radial):
+                        progress_parts.append(f"hb_radial={_fmt_metric(radial, 6)}")
+                    print(" | ".join(progress_parts))
+
+                if reached_max_steps and (
+                    (not reached_target_runtime)
+                    or (not reached_token_target)
+                    or (not reached_min_steps)
+                ):
+                    warn_parts = [f"max_steps={max_steps} reached early:"]
+                    if not reached_min_steps:
+                        warn_parts.append(f"min_steps={min_steps} not met")
+                    if not reached_target_runtime:
+                        warn_parts.append(
+                            f"target_runtime_minutes={args.target_runtime_minutes:.2f} not met"
+                        )
+                    if not reached_token_target and args.target_train_tokens is not None:
+                        warn_parts.append(
+                            f"target_train_tokens={args.target_train_tokens} not met"
+                        )
+                    print("WARNING: " + "; ".join(warn_parts))
+                    break
+                if reached_min_steps and reached_target_runtime and reached_token_target:
+                    break
+                if reached_max_steps:
+                    break
 
         # Always produce a terminal eval snapshot for summary-level comparison.
         eval_loss_acc = 0.0
@@ -1516,35 +1555,10 @@ def run(args: argparse.Namespace) -> None:
                 ),
             }
         )
+    finally:
+        step_file.flush()
+        step_file.close()
 
-    step_csv = out_dir / "benchmark_steps.csv"
-    summary_csv = out_dir / "benchmark_summary.csv"
-    meta_json = out_dir / "run_meta.json"
-
-    _write_csv(
-        step_csv,
-        step_rows,
-        fieldnames=[
-            "config",
-            "hyperball_on",
-            "grouped",
-            "lora_hook_on",
-            "step",
-            "loss",
-            "next_token_ce",
-            "distill_kl",
-            "step_ms",
-            "tokens_per_s",
-            "grad_norm",
-            "update_norm",
-            "learning_rate",
-            "eval_loss",
-            "eval_next_token_ce",
-            "eval_distill_kl",
-            "hyperball_angle_mean",
-            "hyperball_radial_frac_mean",
-        ],
-    )
     _write_csv(
         summary_csv,
         summary_rows,
@@ -1598,6 +1612,7 @@ def run(args: argparse.Namespace) -> None:
         "eval_interval": args.eval_interval,
         "eval_batches": args.eval_batches,
         "log_interval": args.log_interval,
+        "step_record_interval": args.step_record_interval,
         "shift_start_frac": args.shift_start_frac,
         "train_rare_token_prob": args.train_rare_token_prob,
         "eval_rare_token_prob": args.eval_rare_token_prob,
@@ -1661,6 +1676,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--eval-interval", type=int, default=5)
     p.add_argument("--eval-batches", type=int, default=2)
     p.add_argument("--log-interval", type=int, default=10)
+    p.add_argument("--step-record-interval", type=int, default=1)
     p.add_argument("--shift-start-frac", type=float, default=0.5)
     p.add_argument("--train-rare-token-prob", type=float, default=0.03)
     p.add_argument("--eval-rare-token-prob", type=float, default=0.08)
