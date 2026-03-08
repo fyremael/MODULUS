@@ -60,6 +60,8 @@ python scripts/run_benchmarks.py \
   --auto-seq-len-by-memory \
   --auto-disable-distill-for-memory \
   --compile-retry-attempts 3 \
+  --compile-heartbeat-sec 30 \
+  --telemetry-memory-interval 25 \
   --auto-token-pool-by-host-ram \
   --host-ram-token-pool-fraction 0.20 \
   --dataset-http-cache-dir artifacts/datasets/hf_http_cache \
@@ -83,6 +85,11 @@ If rate-limited, increase `--dataset-http-max-retries` and
 Use `--log-interval` (for example `10`) to print rich live progress lines.
 For long runs, increase `--step-record-interval` (for example `10` or `25`) to
 reduce memory and CSV size while preserving eval snapshots.
+TPU observability knobs: `--compile-heartbeat-sec` emits periodic heartbeat logs during
+first-step XLA compile, and `--telemetry-memory-interval` samples host/device memory
+proxies into `benchmark_steps.csv`.
+Optional profiler capture: `--profile-trace --profile-trace-dir <path>` and/or
+`--profile-server-port <port>` for TensorBoard profiler attachment.
 Hardware-aware mode is on by default and can downshift `batch_size` or
 `token_pool_batches` when requested settings exceed device/host limits.
 For `hf_stream` mode, set `HF_HOME` / `HF_DATASETS_CACHE` to a persistent path
@@ -109,7 +116,9 @@ python scripts/run_benchmarks.py \
   --lr-schedule warmup_cosine \
   --lr-warmup-steps 2000 \
   --lr-min-ratio 0.10 \
-  --lr-total-steps 90000
+  --lr-total-steps 90000 \
+  --compile-heartbeat-sec 30 \
+  --telemetry-memory-interval 25
 ```
 
 Build benchmark report from CSV artifacts:

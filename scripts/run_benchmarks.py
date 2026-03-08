@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import dataclasses
 import datetime as dt
@@ -10,6 +11,8 @@ import math
 import os
 import random
 import re
+import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -644,6 +647,116 @@ def _available_host_ram_bytes() -> Optional[int]:
     return None
 
 
+def _process_rss_bytes() -> Optional[int]:
+    try:
+        import psutil  # type: ignore
+
+        return int(psutil.Process(os.getpid()).memory_info().rss)
+    except Exception:
+        pass
+    try:
+        import resource  # type: ignore
+
+        rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        if rss <= 0:
+            return None
+        # Linux reports KiB; macOS reports bytes.
+        if sys.platform.startswith("darwin"):
+            return rss
+        return rss * 1024
+    except Exception:
+        pass
+    try:
+        status_path = Path("/proc/self/status")
+        if status_path.exists():
+            for line in status_path.read_text(encoding="utf-8").splitlines():
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+
+def _device_memory_snapshot_bytes() -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    bytes_in_use = 0
+    peak_bytes_in_use = 0
+    bytes_limit = 0
+    saw_stats = False
+    for dev in jax.devices():
+        stats_fn = getattr(dev, "memory_stats", None)
+        if not callable(stats_fn):
+            continue
+        try:
+            stats = stats_fn()
+        except Exception:
+            continue
+        if not isinstance(stats, Mapping):
+            continue
+        saw_stats = True
+        in_use_val = stats.get("bytes_in_use")
+        peak_val = stats.get("peak_bytes_in_use")
+        limit_val = stats.get("bytes_limit")
+        if isinstance(in_use_val, (int, float)):
+            bytes_in_use += int(in_use_val)
+        if isinstance(peak_val, (int, float)):
+            peak_bytes_in_use += int(peak_val)
+        if isinstance(limit_val, (int, float)):
+            bytes_limit += int(limit_val)
+    if not saw_stats:
+        return None, None, None
+    return bytes_in_use, peak_bytes_in_use, bytes_limit
+
+
+def _runtime_telemetry_snapshot() -> Dict[str, float]:
+    gb = float(1024**3)
+    rss_bytes = _process_rss_bytes()
+    dev_in_use, dev_peak, dev_limit = _device_memory_snapshot_bytes()
+    return {
+        "host_rss_gb": (float(rss_bytes) / gb) if rss_bytes is not None else float("nan"),
+        "device_mem_inuse_gb": (
+            float(dev_in_use) / gb if dev_in_use is not None else float("nan")
+        ),
+        "device_mem_peak_gb": (float(dev_peak) / gb if dev_peak is not None else float("nan")),
+        "device_mem_limit_gb": (
+            float(dev_limit) / gb if dev_limit is not None else float("nan")
+        ),
+    }
+
+
+def _start_periodic_heartbeat(label: str, interval_sec: float):
+    if interval_sec <= 0:
+        return lambda: None
+
+    stop_event = threading.Event()
+    t0 = time.perf_counter()
+
+    def _worker() -> None:
+        while not stop_event.wait(interval_sec):
+            elapsed = time.perf_counter() - t0
+            print(f"{label}: still running ({elapsed:.1f}s elapsed)")
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+    def _stop() -> None:
+        stop_event.set()
+        thread.join(timeout=0.1)
+
+    return _stop
+
+
+def _step_trace_scope(enabled: bool, name: str):
+    if not enabled:
+        return contextlib.nullcontext()
+    try:
+        import jax.profiler as jprof  # type: ignore
+    except Exception:
+        return contextlib.nullcontext()
+    return jprof.StepTraceAnnotation(name)
+
+
 def _is_probable_compile_oom(exc: BaseException) -> bool:
     msg = str(exc).lower()
     needles = (
@@ -1269,6 +1382,12 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--lr-total-steps must be >= 1 when provided")
     if args.dataset_http_min_interval_sec < 0:
         raise ValueError("--dataset-http-min-interval-sec must be >= 0")
+    if args.compile_heartbeat_sec < 0:
+        raise ValueError("--compile-heartbeat-sec must be >= 0")
+    if args.telemetry_memory_interval < 1:
+        raise ValueError("--telemetry-memory-interval must be >= 1")
+    if args.profile_server_port < 0:
+        raise ValueError("--profile-server-port must be >= 0")
     if not (0.0 <= args.dataset_eval_holdout_fraction < 1.0):
         raise ValueError("--dataset-eval-holdout-fraction must be in [0, 1)")
     if (
@@ -1311,6 +1430,24 @@ def run(args: argparse.Namespace) -> None:
     out_root = root / "artifacts" / "benchmarks"
     out_dir = _timestamp_dir(out_root) if args.out_dir is None else Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    trace_dir = (
+        Path(args.profile_trace_dir)
+        if args.profile_trace_dir
+        else (out_dir / "jax_profile_trace")
+    )
+    profiler_server_started = False
+    if args.profile_server_port > 0:
+        try:
+            import jax.profiler as jprof  # type: ignore
+
+            jprof.start_server(args.profile_server_port)
+            profiler_server_started = True
+            print(
+                f"Profiler server started on port {args.profile_server_port}. "
+                "Connect TensorBoard profiler to capture live TPU traces."
+            )
+        except Exception as exc:
+            print(f"WARNING: failed to start profiler server: {exc}")
 
     requested_batch_size = args.batch_size
     requested_seq_len = args.seq_len
@@ -1699,6 +1836,13 @@ def run(args: argparse.Namespace) -> None:
             else:
                 raise
 
+    print(
+        "Instrumentation: "
+        f"compile_heartbeat_sec={args.compile_heartbeat_sec}, "
+        f"telemetry_memory_interval={args.telemetry_memory_interval}, "
+        f"profile_trace={args.profile_trace}"
+    )
+
     step_csv = out_dir / "benchmark_steps.csv"
     summary_csv = out_dir / "benchmark_summary.csv"
     meta_json = out_dir / "run_meta.json"
@@ -1713,13 +1857,20 @@ def run(args: argparse.Namespace) -> None:
         "next_token_ce",
         "distill_kl",
         "step_ms",
+        "dispatch_ms",
+        "sync_ms",
         "tokens_per_s",
         "grad_norm",
         "update_norm",
         "learning_rate",
+        "eval_ms",
         "eval_loss",
         "eval_next_token_ce",
         "eval_distill_kl",
+        "host_rss_gb",
+        "device_mem_inuse_gb",
+        "device_mem_peak_gb",
+        "device_mem_limit_gb",
         "hyperball_angle_mean",
         "hyperball_radial_frac_mean",
     ]
@@ -1727,11 +1878,25 @@ def run(args: argparse.Namespace) -> None:
     step_writer = csv.DictWriter(step_file, fieldnames=step_fieldnames)
     step_writer.writeheader()
     summary_rows: List[Dict[str, Any]] = []
+    trace_active = False
+    if args.profile_trace:
+        try:
+            import jax.profiler as jprof  # type: ignore
+
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            jprof.start_trace(str(trace_dir))
+            trace_active = True
+            print(f"Profiler trace capture enabled: {trace_dir}")
+        except Exception as exc:
+            print(f"WARNING: failed to start profiler trace capture: {exc}")
     try:
         for cfg in configs:
             runtime_batch_size = args.batch_size
             runtime_grad_accum_steps = args.grad_accum_steps
             attempt = 0
+            warmup_step1_s = float("nan")
+            warmup_steady_s = float("nan")
+            warmup_compile_estimate_s = float("nan")
             while True:
                 print(
                     f"Starting config={cfg.name} "
@@ -1788,33 +1953,67 @@ def run(args: argparse.Namespace) -> None:
                             f"  - warmup: running {args.warmup_steps} step(s); "
                             "step 1 triggers XLA compile and may take several minutes on TPU."
                         )
+                    warmup_step_s: List[float] = []
                     for i in range(args.warmup_steps):
                         warm_step_t0 = time.perf_counter()
-                        (
-                            params,
-                            opt_state,
-                            loss_val,
-                            ce_val,
-                            kl_val,
-                            grad_norm,
-                            update_norm,
-                        ) = step_fn(
-                            params,
-                            opt_state,
-                            train_tokens[i, :runtime_batch_size, :],
+                        stop_heartbeat = (
+                            _start_periodic_heartbeat(
+                                "  - warmup step 1 compile heartbeat",
+                                args.compile_heartbeat_sec,
+                            )
+                            if i == 0
+                            else (lambda: None)
                         )
-                        jax.block_until_ready(loss_val)
-                        jax.block_until_ready(ce_val)
-                        jax.block_until_ready(kl_val)
-                        jax.block_until_ready(grad_norm)
-                        jax.block_until_ready(update_norm)
+                        dispatch_t0 = time.perf_counter()
+                        try:
+                            with _step_trace_scope(
+                                args.profile_trace, f"{cfg.name}/warmup_step_{i + 1}"
+                            ):
+                                (
+                                    params,
+                                    opt_state,
+                                    loss_val,
+                                    ce_val,
+                                    kl_val,
+                                    grad_norm,
+                                    update_norm,
+                                ) = step_fn(
+                                    params,
+                                    opt_state,
+                                    train_tokens[i, :runtime_batch_size, :],
+                                )
+                            dispatch_ms = (time.perf_counter() - dispatch_t0) * 1000.0
+                            sync_t0 = time.perf_counter()
+                            jax.block_until_ready(loss_val)
+                            jax.block_until_ready(ce_val)
+                            jax.block_until_ready(kl_val)
+                            jax.block_until_ready(grad_norm)
+                            jax.block_until_ready(update_norm)
+                            sync_ms = (time.perf_counter() - sync_t0) * 1000.0
+                        finally:
+                            stop_heartbeat()
                         warm_step_s = time.perf_counter() - warm_step_t0
+                        warmup_step_s.append(warm_step_s)
                         if i == 0:
+                            warmup_step1_s = warm_step_s
                             print(
-                                f"  - warmup: step 1 compile+execute complete in {warm_step_s:.2f}s"
+                                "  - warmup: step 1 compile+execute complete in "
+                                f"{warm_step_s:.2f}s "
+                                f"(dispatch_ms={dispatch_ms:.2f}, sync_ms={sync_ms:.2f})"
                             )
                         elif i + 1 == args.warmup_steps:
-                            print(f"  - warmup: final step complete in {warm_step_s:.2f}s")
+                            print(
+                                f"  - warmup: final step complete in {warm_step_s:.2f}s "
+                                f"(dispatch_ms={dispatch_ms:.2f}, sync_ms={sync_ms:.2f})"
+                            )
+                    if len(warmup_step_s) >= 2:
+                        warmup_steady_s = sum(warmup_step_s[1:]) / float(len(warmup_step_s) - 1)
+                        warmup_compile_estimate_s = max(warmup_step_s[0] - warmup_steady_s, 0.0)
+                        print(
+                            "  - warmup: estimated compile-only overhead "
+                            f"{warmup_compile_estimate_s:.2f}s "
+                            f"(step1={warmup_step_s[0]:.2f}s, steady={warmup_steady_s:.2f}s)"
+                        )
                     break
                 except Exception as exc:
                     can_retry = (
@@ -1859,7 +2058,11 @@ def run(args: argparse.Namespace) -> None:
             best_eval_loss = float("inf")
             final_eval_loss = float("nan")
             step_ms_total = 0.0
+            dispatch_ms_total = 0.0
+            sync_ms_total = 0.0
             tokens_per_s_total = 0.0
+            eval_ms_total = 0.0
+            eval_events = 0
             grad_norm_total = 0.0
             update_norm_total = 0.0
             learning_rate_total = 0.0
@@ -1867,20 +2070,29 @@ def run(args: argparse.Namespace) -> None:
             hb_last: Dict[str, float] = {}
             step_count = 0
             tokens_processed = 0
+            host_rss_last = float("nan")
+            device_mem_inuse_last = float("nan")
+            device_mem_peak_last = float("nan")
+            device_mem_limit_last = float("nan")
 
             while True:
                 step = step_count
                 token_idx = (args.warmup_steps + step) % train_pool_batches
                 tokens = train_tokens[token_idx, :runtime_batch_size, :]
                 t0 = time.perf_counter()
-                params, opt_state, loss_val, ce_val, kl_val, grad_norm, update_norm = step_fn(
-                    params, opt_state, tokens
-                )
+                dispatch_t0 = time.perf_counter()
+                with _step_trace_scope(args.profile_trace, f"{cfg.name}/train_step"):
+                    params, opt_state, loss_val, ce_val, kl_val, grad_norm, update_norm = step_fn(
+                        params, opt_state, tokens
+                    )
+                dispatch_ms = (time.perf_counter() - dispatch_t0) * 1000.0
+                sync_t0 = time.perf_counter()
                 jax.block_until_ready(loss_val)
                 jax.block_until_ready(ce_val)
                 jax.block_until_ready(kl_val)
                 jax.block_until_ready(grad_norm)
                 jax.block_until_ready(update_norm)
+                sync_ms = (time.perf_counter() - sync_t0) * 1000.0
                 step_ms = (time.perf_counter() - t0) * 1000.0
                 tokens_per_s = (runtime_batch_size * args.seq_len) / max(step_ms / 1000.0, 1e-9)
 
@@ -1895,17 +2107,20 @@ def run(args: argparse.Namespace) -> None:
                 eval_loss = float("nan")
                 eval_ce = float("nan")
                 eval_kl = float("nan")
+                eval_ms = float("nan")
                 should_eval = args.eval_interval > 0 and (
                     (step + 1) % args.eval_interval == 0 or step == (args.steps - 1)
                 )
                 if should_eval:
+                    eval_t0 = time.perf_counter()
                     eval_loss_acc = 0.0
                     eval_ce_acc = 0.0
                     eval_kl_acc = 0.0
                     for eval_idx in range(args.eval_batches):
-                        loss_eval, ce_eval, kl_eval = eval_fn(
-                            params, eval_tokens[eval_idx, :runtime_batch_size, :]
-                        )
+                        with _step_trace_scope(args.profile_trace, f"{cfg.name}/eval_step"):
+                            loss_eval, ce_eval, kl_eval = eval_fn(
+                                params, eval_tokens[eval_idx, :runtime_batch_size, :]
+                            )
                         loss_eval = float(jax.block_until_ready(loss_eval))
                         ce_eval = float(jax.block_until_ready(ce_eval))
                         kl_eval = float(jax.block_until_ready(kl_eval))
@@ -1915,8 +2130,21 @@ def run(args: argparse.Namespace) -> None:
                     eval_loss = eval_loss_acc / float(args.eval_batches)
                     eval_ce = eval_ce_acc / float(args.eval_batches)
                     eval_kl = eval_kl_acc / float(args.eval_batches)
+                    eval_ms = (time.perf_counter() - eval_t0) * 1000.0
                     final_eval_loss = eval_loss
                     best_eval_loss = min(best_eval_loss, eval_loss)
+
+                telemetry_due = (
+                    step_count == 0
+                    or should_eval
+                    or (step_count % args.telemetry_memory_interval == 0)
+                )
+                if telemetry_due:
+                    telemetry = _runtime_telemetry_snapshot()
+                    host_rss_last = telemetry["host_rss_gb"]
+                    device_mem_inuse_last = telemetry["device_mem_inuse_gb"]
+                    device_mem_peak_last = telemetry["device_mem_peak_gb"]
+                    device_mem_limit_last = telemetry["device_mem_limit_gb"]
 
                 row = {
                     "config": cfg.name,
@@ -1928,13 +2156,20 @@ def run(args: argparse.Namespace) -> None:
                     "next_token_ce": f"{ce_scalar:.8f}",
                     "distill_kl": f"{kl_scalar:.8f}",
                     "step_ms": f"{step_ms:.4f}",
+                    "dispatch_ms": f"{dispatch_ms:.4f}",
+                    "sync_ms": f"{sync_ms:.4f}",
                     "tokens_per_s": f"{tokens_per_s:.2f}",
                     "grad_norm": f"{grad_norm_scalar:.8f}",
                     "update_norm": f"{update_norm_scalar:.8f}",
                     "learning_rate": f"{learning_rate_scalar:.10f}",
+                    "eval_ms": f"{eval_ms:.4f}",
                     "eval_loss": f"{eval_loss:.8f}",
                     "eval_next_token_ce": f"{eval_ce:.8f}",
                     "eval_distill_kl": f"{eval_kl:.8f}",
+                    "host_rss_gb": f"{host_rss_last:.4f}",
+                    "device_mem_inuse_gb": f"{device_mem_inuse_last:.4f}",
+                    "device_mem_peak_gb": f"{device_mem_peak_last:.4f}",
+                    "device_mem_limit_gb": f"{device_mem_limit_last:.4f}",
                     "hyperball_angle_mean": (
                         f"{hb_metrics.get('hyperball/angle_mean', float('nan')):.8f}"
                     ),
@@ -1957,7 +2192,12 @@ def run(args: argparse.Namespace) -> None:
                 ce_last = ce_scalar
                 kl_last = kl_scalar
                 step_ms_total += step_ms
+                dispatch_ms_total += dispatch_ms
+                sync_ms_total += sync_ms
                 tokens_per_s_total += tokens_per_s
+                if should_eval and not math.isnan(eval_ms):
+                    eval_ms_total += eval_ms
+                    eval_events += 1
                 grad_norm_total += grad_norm_scalar
                 update_norm_total += update_norm_scalar
                 learning_rate_total += learning_rate_scalar
@@ -1984,6 +2224,8 @@ def run(args: argparse.Namespace) -> None:
                     should_log = True
                 if should_log:
                     avg_step_ms = step_ms_total / max(step_count, 1)
+                    avg_dispatch_ms = dispatch_ms_total / max(step_count, 1)
+                    avg_sync_ms = sync_ms_total / max(step_count, 1)
                     avg_toks_per_s = tokens_per_s_total / max(step_count, 1)
                     runtime_min = elapsed / 60.0
                     eta_by_steps_min = (
@@ -2011,6 +2253,8 @@ def run(args: argparse.Namespace) -> None:
                         f"train_ce={_fmt_metric(ce_scalar, 6)}",
                         f"train_kl={_fmt_metric(kl_scalar, 6)}",
                         f"avg_step_ms={_fmt_metric(avg_step_ms, 2)}",
+                        f"avg_dispatch_ms={_fmt_metric(avg_dispatch_ms, 2)}",
+                        f"avg_sync_ms={_fmt_metric(avg_sync_ms, 2)}",
                         f"avg_tok_s={_fmt_metric(avg_toks_per_s, 2)}",
                         f"grad_norm={_fmt_metric(grad_norm_scalar, 6)}",
                         f"update_norm={_fmt_metric(update_norm_scalar, 6)}",
@@ -2024,7 +2268,17 @@ def run(args: argparse.Namespace) -> None:
                         progress_parts.append(f"val_loss={_fmt_metric(eval_loss, 6)}")
                         progress_parts.append(f"val_ce={_fmt_metric(eval_ce, 6)}")
                         progress_parts.append(f"val_kl={_fmt_metric(eval_kl, 6)}")
+                        progress_parts.append(f"eval_ms={_fmt_metric(eval_ms, 2)}")
                         progress_parts.append(f"best_val={_fmt_metric(best_eval_loss, 6)}")
+                    progress_parts.append(f"host_rss_gb={_fmt_metric(host_rss_last, 3)}")
+                    if not math.isnan(device_mem_inuse_last):
+                        progress_parts.append(
+                            f"dev_mem_gb={_fmt_metric(device_mem_inuse_last, 3)}"
+                        )
+                    if not math.isnan(device_mem_peak_last):
+                        progress_parts.append(
+                            f"dev_peak_gb={_fmt_metric(device_mem_peak_last, 3)}"
+                        )
                     angle = hb_metrics.get("hyperball/angle_mean", float("nan"))
                     radial = hb_metrics.get("hyperball/radial_frac_mean", float("nan"))
                     if not math.isnan(angle):
@@ -2095,11 +2349,21 @@ def run(args: argparse.Namespace) -> None:
                 "final_eval_loss": f"{final_eval_loss:.8f}",
                 "best_eval_loss": f"{best_eval_loss:.8f}",
                 "avg_step_ms": f"{(step_ms_total / max(step_count, 1)):.4f}",
+                "avg_dispatch_ms": f"{(dispatch_ms_total / max(step_count, 1)):.4f}",
+                "avg_sync_ms": f"{(sync_ms_total / max(step_count, 1)):.4f}",
                 "avg_tokens_per_s": f"{(tokens_per_s_total / max(step_count, 1)):.2f}",
+                "avg_eval_ms": f"{(eval_ms_total / max(eval_events, 1)):.4f}",
                 "avg_grad_norm": f"{(grad_norm_total / max(step_count, 1)):.8f}",
                 "avg_update_norm": f"{(update_norm_total / max(step_count, 1)):.8f}",
                 "avg_learning_rate": f"{(learning_rate_total / max(step_count, 1)):.10f}",
                 "final_learning_rate": f"{learning_rate_last:.10f}",
+                "warmup_step1_s": f"{warmup_step1_s:.4f}",
+                "warmup_steady_s": f"{warmup_steady_s:.4f}",
+                "warmup_compile_estimate_s": f"{warmup_compile_estimate_s:.4f}",
+                "final_host_rss_gb": f"{host_rss_last:.4f}",
+                "final_device_mem_inuse_gb": f"{device_mem_inuse_last:.4f}",
+                "final_device_mem_peak_gb": f"{device_mem_peak_last:.4f}",
+                "final_device_mem_limit_gb": f"{device_mem_limit_last:.4f}",
                 "final_hyperball_angle_mean": (
                     f"{hb_last.get('hyperball/angle_mean', float('nan')):.8f}"
                 ),
@@ -2111,6 +2375,14 @@ def run(args: argparse.Namespace) -> None:
     finally:
         step_file.flush()
         step_file.close()
+        if trace_active:
+            try:
+                import jax.profiler as jprof  # type: ignore
+
+                jprof.stop_trace()
+                print(f"Profiler trace written to: {trace_dir}")
+            except Exception as exc:
+                print(f"WARNING: failed to stop profiler trace cleanly: {exc}")
 
     _write_csv(
         summary_csv,
@@ -2134,11 +2406,21 @@ def run(args: argparse.Namespace) -> None:
             "final_eval_loss",
             "best_eval_loss",
             "avg_step_ms",
+            "avg_dispatch_ms",
+            "avg_sync_ms",
             "avg_tokens_per_s",
+            "avg_eval_ms",
             "avg_grad_norm",
             "avg_update_norm",
             "avg_learning_rate",
             "final_learning_rate",
+            "warmup_step1_s",
+            "warmup_steady_s",
+            "warmup_compile_estimate_s",
+            "final_host_rss_gb",
+            "final_device_mem_inuse_gb",
+            "final_device_mem_peak_gb",
+            "final_device_mem_limit_gb",
             "final_hyperball_angle_mean",
             "final_hyperball_radial_frac_mean",
         ],
@@ -2174,6 +2456,12 @@ def run(args: argparse.Namespace) -> None:
         "configs": [c.name for c in configs],
         "warmup_steps": args.warmup_steps,
         "compile_retry_attempts": args.compile_retry_attempts,
+        "compile_heartbeat_sec": args.compile_heartbeat_sec,
+        "telemetry_memory_interval": args.telemetry_memory_interval,
+        "profile_trace": args.profile_trace,
+        "profile_trace_dir": str(trace_dir),
+        "profile_server_port": args.profile_server_port,
+        "profile_server_started": profiler_server_started,
         "auto_seq_len_by_memory": args.auto_seq_len_by_memory,
         "auto_disable_distill_for_memory": args.auto_disable_distill_for_memory,
         "distill_disable_param_threshold": args.distill_disable_param_threshold,
@@ -2202,6 +2490,9 @@ def run(args: argparse.Namespace) -> None:
         "jax_version": jax.__version__,
         "jax_backend": jax.default_backend(),
         "jax_devices": [str(d) for d in jax.devices()],
+        "jax_process_index": jax.process_index(),
+        "jax_process_count": jax.process_count(),
+        "jax_local_device_count": jax.local_device_count(),
         "output_dir": str(out_dir),
     }
     meta_json.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -2217,7 +2508,10 @@ def run(args: argparse.Namespace) -> None:
         print(
             f"- {r['config']}: final_loss={r['final_loss']}, "
             f"final_eval_loss={r['final_eval_loss']}, "
-            f"avg_step_ms={r['avg_step_ms']}, avg_tokens_per_s={r['avg_tokens_per_s']}, "
+            f"avg_step_ms={r['avg_step_ms']}, "
+            f"avg_dispatch_ms={r['avg_dispatch_ms']}, avg_sync_ms={r['avg_sync_ms']}, "
+            f"avg_tokens_per_s={r['avg_tokens_per_s']}, "
+            f"warmup_compile_estimate_s={r['warmup_compile_estimate_s']}, "
             f"angle={angle}, radial={radial}"
         )
 
@@ -2291,6 +2585,15 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--log-interval", type=int, default=10)
     p.add_argument("--step-record-interval", type=int, default=1)
     p.add_argument("--compile-retry-attempts", type=int, default=2)
+    p.add_argument("--compile-heartbeat-sec", type=float, default=30.0)
+    p.add_argument("--telemetry-memory-interval", type=int, default=25)
+    p.add_argument(
+        "--profile-trace",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    p.add_argument("--profile-trace-dir", type=str, default=None)
+    p.add_argument("--profile-server-port", type=int, default=0)
     p.add_argument("--shift-start-frac", type=float, default=0.5)
     p.add_argument("--train-rare-token-prob", type=float, default=0.03)
     p.add_argument("--eval-rare-token-prob", type=float, default=0.08)
