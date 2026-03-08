@@ -50,6 +50,7 @@ python scripts/run_benchmarks.py \
   --dataset-eval-split train \
   --dataset-tokenizer-backend tiktoken \
   --dataset-tokenizer-name cl100k_base \
+  --dataset-eval-holdout-fraction 0.01 \
   --hardware-aware \
   --auto-adjust-max-steps-for-token-target \
   --param-dtype auto \
@@ -75,6 +76,8 @@ send `Authorization: Bearer ...` to dataset-server.
 The default real-data tokenizer backend is `tiktoken` (`cl100k_base` by default).
 Alternative backends: `--dataset-tokenizer-backend hash` (legacy regex/hash) and
 `--dataset-tokenizer-backend hf_auto --dataset-tokenizer-name <hf_tokenizer_id>`.
+When train and eval use the same split, set `--dataset-eval-holdout-fraction 0.01`
+to keep validation isolated as a deterministic 1% holdout.
 If rate-limited, increase `--dataset-http-max-retries` and
 `--dataset-http-min-interval-sec`.
 Use `--log-interval` (for example `10`) to print rich live progress lines.
@@ -97,6 +100,7 @@ python scripts/run_benchmarks.py \
   --dataset-config sample-10BT \
   --dataset-tokenizer-backend tiktoken \
   --dataset-tokenizer-name cl100k_base \
+  --dataset-eval-holdout-fraction 0.01 \
   --configs baseline \
   --target-train-tokens 1000000000 \
   --steps 1000 \

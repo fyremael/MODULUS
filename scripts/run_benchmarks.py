@@ -842,6 +842,25 @@ def _build_text_tokenizer(
     )
 
 
+def _doc_partition_mode_for_text(
+    text: str,
+    *,
+    partition_mode: str,
+    eval_holdout_fraction: float,
+    partition_salt: int,
+) -> bool:
+    if partition_mode == "all" or eval_holdout_fraction <= 0.0:
+        return True
+    cutoff = int(round(eval_holdout_fraction * 10000.0))
+    cutoff = max(1, min(cutoff, 9999))
+    bucket = zlib.crc32(text.encode("utf-8"), partition_salt & 0xFFFFFFFF) % 10000
+    if partition_mode == "train":
+        return bucket >= cutoff
+    if partition_mode == "eval":
+        return bucket < cutoff
+    raise ValueError(f"Unsupported partition_mode={partition_mode!r}")
+
+
 def _extract_text(example: Mapping[str, Any], text_keys: Sequence[str]) -> Optional[str]:
     for key in text_keys:
         value = example.get(key)
@@ -939,13 +958,25 @@ def _collect_stream_token_ids(
     tokenize_text: Callable[[str], List[int]],
     max_docs: Optional[int],
     progress_label: str,
+    partition_mode: str,
+    eval_holdout_fraction: float,
+    partition_salt: int,
 ) -> Tuple[jnp.ndarray, int]:
     flat_tokens = array("I")
     docs_seen = 0
+    docs_used = 0
 
     for text in text_iter:
         try:
             docs_seen += 1
+            if not _doc_partition_mode_for_text(
+                text,
+                partition_mode=partition_mode,
+                eval_holdout_fraction=eval_holdout_fraction,
+                partition_salt=partition_salt,
+            ):
+                continue
+            docs_used += 1
             flat_tokens.extend(tokenize_text(text))
         except ImportError as exc:
             if _is_numpy_umath_center_error(exc):
@@ -958,11 +989,11 @@ def _collect_stream_token_ids(
 
         if len(flat_tokens) >= required_tokens:
             break
-        if max_docs is not None and docs_seen >= max_docs:
+        if max_docs is not None and docs_used >= max_docs:
             break
         if docs_seen % 1000 == 0:
             print(
-                f"{progress_label}: docs={docs_seen}, "
+                f"{progress_label}: docs_seen={docs_seen}, docs_used={docs_used}, "
                 f"tokens={len(flat_tokens)}/{required_tokens}"
             )
 
@@ -973,7 +1004,7 @@ def _collect_stream_token_ids(
         )
 
     token_arr = jnp.asarray(flat_tokens[:required_tokens], dtype=jnp.int32)
-    return token_arr, docs_seen
+    return token_arr, docs_used
 
 
 def _make_hf_stream_batches(
@@ -986,6 +1017,9 @@ def _make_hf_stream_batches(
     seq_len: int,
     max_docs: Optional[int],
     tokenize_text: Callable[[str], List[int]],
+    partition_mode: str,
+    eval_holdout_fraction: float,
+    partition_salt: int,
 ) -> jnp.ndarray:
     required_tokens = num_batches * batch_size * seq_len
     text_iter = _make_hf_text_iterator(
@@ -1003,6 +1037,9 @@ def _make_hf_stream_batches(
         tokenize_text=tokenize_text,
         max_docs=max_docs,
         progress_label=f"hf_stream[{split}]",
+        partition_mode=partition_mode,
+        eval_holdout_fraction=eval_holdout_fraction,
+        partition_salt=partition_salt,
     )
     print(
         f"hf_stream[{split}]: collected {required_tokens} tokens from {docs_seen} documents."
@@ -1162,6 +1199,9 @@ def _make_hf_http_batches(
     seq_len: int,
     max_docs: Optional[int],
     tokenize_text: Callable[[str], List[int]],
+    partition_mode: str,
+    eval_holdout_fraction: float,
+    partition_salt: int,
 ) -> jnp.ndarray:
     required_tokens = num_batches * batch_size * seq_len
     text_iter = _make_hf_http_text_iterator(
@@ -1184,6 +1224,9 @@ def _make_hf_http_batches(
         tokenize_text=tokenize_text,
         max_docs=max_docs,
         progress_label=f"hf_http[{split}]",
+        partition_mode=partition_mode,
+        eval_holdout_fraction=eval_holdout_fraction,
+        partition_salt=partition_salt,
     )
     print(
         f"hf_http[{split}]: collected {required_tokens} tokens from {docs_seen} documents."
@@ -1226,6 +1269,8 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--lr-total-steps must be >= 1 when provided")
     if args.dataset_http_min_interval_sec < 0:
         raise ValueError("--dataset-http-min-interval-sec must be >= 0")
+    if not (0.0 <= args.dataset_eval_holdout_fraction < 1.0):
+        raise ValueError("--dataset-eval-holdout-fraction must be in [0, 1)")
     if (
         (args.dataset_http_cache_read or args.dataset_http_cache_write)
         and not args.dataset_http_cache_dir
@@ -1531,6 +1576,14 @@ def run(args: argparse.Namespace) -> None:
             vocab_size=args.vocab_size,
             max_doc_tokens=ds_cfg.max_doc_tokens,
         )
+        holdout_fraction = float(args.dataset_eval_holdout_fraction)
+        train_eval_same_split = ds_cfg.train_split == ds_cfg.eval_split
+        train_partition_mode = (
+            "train" if (train_eval_same_split and holdout_fraction > 0.0) else "all"
+        )
+        eval_partition_mode = (
+            "eval" if (train_eval_same_split and holdout_fraction > 0.0) else "all"
+        )
         print(
             "Using real-world text stream dataset: "
             f"{ds_cfg.name} [{ds_cfg.config or 'default'}]"
@@ -1544,6 +1597,16 @@ def run(args: argparse.Namespace) -> None:
             "Dataset tokenizer: "
             f"backend={ds_cfg.tokenizer_backend}, name={tokenizer_name_display}"
         )
+        if train_eval_same_split and holdout_fraction > 0.0:
+            print(
+                "Dataset split isolation: "
+                f"holding out {holdout_fraction * 100.0:.2f}% of train split for eval"
+            )
+        elif train_eval_same_split:
+            print(
+                "WARNING: train/eval use same split with holdout fraction=0.0; "
+                "this can leak samples between training and validation."
+            )
         if args.data_source == "hf_http":
             token_present = bool(ds_cfg.http_token_env and os.environ.get(ds_cfg.http_token_env))
             print(
@@ -1555,18 +1618,22 @@ def run(args: argparse.Namespace) -> None:
                 f"read={ds_cfg.http_cache_read}, write={ds_cfg.http_cache_write}"
             )
         if args.data_source == "hf_stream":
-            train_tokens = _make_hf_stream_batches(
-                ds_cfg,
-                split=ds_cfg.train_split,
-                seed=args.seed + 11,
-                num_batches=train_pool_batches,
-                batch_size=args.batch_size,
-                seq_len=args.seq_len,
-                max_docs=ds_cfg.train_max_docs,
-                tokenize_text=tokenize_text,
-            )
+            def build_train(seed_val: int, partition_mode: str) -> jnp.ndarray:
+                return _make_hf_stream_batches(
+                    ds_cfg,
+                    split=ds_cfg.train_split,
+                    seed=seed_val,
+                    num_batches=train_pool_batches,
+                    batch_size=args.batch_size,
+                    seq_len=args.seq_len,
+                    max_docs=ds_cfg.train_max_docs,
+                    tokenize_text=tokenize_text,
+                    partition_mode=partition_mode,
+                    eval_holdout_fraction=holdout_fraction,
+                    partition_salt=args.seed + 907,
+                )
 
-            def build_eval(split_name: str, seed_val: int):
+            def build_eval(split_name: str, seed_val: int, partition_mode: str) -> jnp.ndarray:
                 return _make_hf_stream_batches(
                     ds_cfg,
                     split=split_name,
@@ -1576,20 +1643,28 @@ def run(args: argparse.Namespace) -> None:
                     seq_len=args.seq_len,
                     max_docs=ds_cfg.eval_max_docs,
                     tokenize_text=tokenize_text,
+                    partition_mode=partition_mode,
+                    eval_holdout_fraction=holdout_fraction,
+                    partition_salt=args.seed + 907,
                 )
 
         else:
-            train_tokens = _make_hf_http_batches(
-                ds_cfg,
-                split=ds_cfg.train_split,
-                num_batches=train_pool_batches,
-                batch_size=args.batch_size,
-                seq_len=args.seq_len,
-                max_docs=ds_cfg.train_max_docs,
-                tokenize_text=tokenize_text,
-            )
+            def build_train(seed_val: int, partition_mode: str) -> jnp.ndarray:
+                del seed_val
+                return _make_hf_http_batches(
+                    ds_cfg,
+                    split=ds_cfg.train_split,
+                    num_batches=train_pool_batches,
+                    batch_size=args.batch_size,
+                    seq_len=args.seq_len,
+                    max_docs=ds_cfg.train_max_docs,
+                    tokenize_text=tokenize_text,
+                    partition_mode=partition_mode,
+                    eval_holdout_fraction=holdout_fraction,
+                    partition_salt=args.seed + 907,
+                )
 
-            def build_eval(split_name: str, seed_val: int):
+            def build_eval(split_name: str, seed_val: int, partition_mode: str) -> jnp.ndarray:
                 del seed_val
                 return _make_hf_http_batches(
                     ds_cfg,
@@ -1599,17 +1674,28 @@ def run(args: argparse.Namespace) -> None:
                     seq_len=args.seq_len,
                     max_docs=ds_cfg.eval_max_docs,
                     tokenize_text=tokenize_text,
+                    partition_mode=partition_mode,
+                    eval_holdout_fraction=holdout_fraction,
+                    partition_salt=args.seed + 907,
                 )
 
+        train_tokens = build_train(args.seed + 11, train_partition_mode)
         try:
-            eval_tokens = build_eval(ds_cfg.eval_split, args.seed + 29)
+            eval_tokens = build_eval(ds_cfg.eval_split, args.seed + 29, eval_partition_mode)
         except Exception as exc:
             if args.dataset_eval_fallback_to_train and ds_cfg.eval_split != ds_cfg.train_split:
                 print(
                     f"Eval split '{ds_cfg.eval_split}' failed ({exc}). "
                     f"Falling back to train split '{ds_cfg.train_split}'."
                 )
-                eval_tokens = build_eval(ds_cfg.train_split, args.seed + 47)
+                if holdout_fraction > 0.0 and train_partition_mode != "train":
+                    print(
+                        "Rebuilding train token pool with holdout partition to keep eval isolated "
+                        f"({holdout_fraction * 100.0:.2f}% eval holdout)."
+                    )
+                    train_partition_mode = "train"
+                    train_tokens = build_train(args.seed + 11, train_partition_mode)
+                eval_tokens = build_eval(ds_cfg.train_split, args.seed + 47, "eval")
             else:
                 raise
 
@@ -2110,6 +2196,7 @@ def run(args: argparse.Namespace) -> None:
         "distill_weight": args.distill_weight,
         "label_smoothing": args.label_smoothing,
         "data_source": args.data_source,
+        "dataset_eval_holdout_fraction": args.dataset_eval_holdout_fraction,
         "dataset": (dataclasses.asdict(ds_cfg) if args.data_source != "synthetic" else None),
         "model": dataclasses.asdict(model_cfg),
         "jax_version": jax.__version__,
@@ -2215,6 +2302,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dataset-text-keys", type=str, default="text,content,document")
     p.add_argument("--dataset-tokenizer-backend", type=str, default="tiktoken")
     p.add_argument("--dataset-tokenizer-name", type=str, default=None)
+    p.add_argument("--dataset-eval-holdout-fraction", type=float, default=0.01)
     p.add_argument("--dataset-shuffle-buffer", type=int, default=10000)
     p.add_argument("--dataset-max-doc-tokens", type=int, default=512)
     p.add_argument("--dataset-train-max-docs", type=int, default=None)
