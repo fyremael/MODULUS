@@ -48,6 +48,8 @@ python scripts/run_benchmarks.py \
   --dataset-config sample-10BT \
   --dataset-train-split train \
   --dataset-eval-split train \
+  --dataset-tokenizer-backend tiktoken \
+  --dataset-tokenizer-name cl100k_base \
   --hardware-aware \
   --auto-adjust-max-steps-for-token-target \
   --param-dtype auto \
@@ -70,6 +72,9 @@ python scripts/run_benchmarks.py \
 Note: for `hf_http`, keep `--dataset-rows-page-size` at `<=100` (HF API limit).
 For higher request budgets, set `HF_TOKEN` in the environment and the runner will
 send `Authorization: Bearer ...` to dataset-server.
+The default real-data tokenizer backend is `tiktoken` (`cl100k_base` by default).
+Alternative backends: `--dataset-tokenizer-backend hash` (legacy regex/hash) and
+`--dataset-tokenizer-backend hf_auto --dataset-tokenizer-name <hf_tokenizer_id>`.
 If rate-limited, increase `--dataset-http-max-retries` and
 `--dataset-http-min-interval-sec`.
 Use `--log-interval` (for example `10`) to print rich live progress lines.
@@ -90,6 +95,8 @@ python scripts/run_benchmarks.py \
   --data-source hf_http \
   --dataset-name HuggingFaceFW/fineweb \
   --dataset-config sample-10BT \
+  --dataset-tokenizer-backend tiktoken \
+  --dataset-tokenizer-name cl100k_base \
   --configs baseline \
   --target-train-tokens 1000000000 \
   --steps 1000 \

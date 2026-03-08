@@ -18,7 +18,7 @@ import zlib
 from array import array
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -105,6 +105,8 @@ class DatasetConfig:
     http_cache_dir: Optional[str]
     http_cache_read: bool
     http_cache_write: bool
+    tokenizer_backend: str
+    tokenizer_name: Optional[str]
 
 
 def _layer_norm(x: jnp.ndarray, scale: jnp.ndarray, eps: float = 1e-5) -> jnp.ndarray:
@@ -742,6 +744,104 @@ def _text_to_ids(text: str, *, vocab_size: int, max_doc_tokens: int) -> List[int
     return ids
 
 
+def _remap_external_token_ids_to_vocab(
+    token_ids: Sequence[int],
+    *,
+    vocab_size: int,
+    max_doc_tokens: int,
+) -> List[int]:
+    if not token_ids:
+        return []
+    if vocab_size <= 3:
+        return []
+    budget = max(max_doc_tokens, 2)
+    body_budget = max(0, budget - 2)
+    mod = vocab_size - 3
+    body = [3 + (int(tok) % mod) for tok in token_ids[:body_budget]]
+    return [1, *body, 2]
+
+
+def _build_text_tokenizer(
+    *,
+    backend: str,
+    tokenizer_name: Optional[str],
+    vocab_size: int,
+    max_doc_tokens: int,
+) -> Callable[[str], List[int]]:
+    backend_norm = backend.strip().lower()
+    if backend_norm == "hash":
+        return lambda text: _text_to_ids(
+            text, vocab_size=vocab_size, max_doc_tokens=max_doc_tokens
+        )
+
+    if backend_norm == "tiktoken":
+        try:
+            import tiktoken  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "tiktoken tokenizer requested but package is not installed. "
+                "Install with: python -m pip install 'tiktoken>=0.9.0'"
+            ) from exc
+
+        name = tokenizer_name or "cl100k_base"
+        encoding = None
+        try:
+            encoding = tiktoken.get_encoding(name)
+        except Exception:
+            try:
+                encoding = tiktoken.encoding_for_model(name)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Unable to load tiktoken encoding/model name {name!r}. "
+                    "Use a valid encoding like 'cl100k_base' or a supported model alias."
+                ) from exc
+
+        if hasattr(encoding, "encode_ordinary"):
+            encode = encoding.encode_ordinary
+        else:
+            encode = lambda s: encoding.encode(s, disallowed_special=())  # noqa: E731
+
+        return lambda text: _remap_external_token_ids_to_vocab(
+            encode(text),
+            vocab_size=vocab_size,
+            max_doc_tokens=max_doc_tokens,
+        )
+
+    if backend_norm == "hf_auto":
+        if not tokenizer_name:
+            raise ValueError(
+                "--dataset-tokenizer-name is required for --dataset-tokenizer-backend=hf_auto "
+                "(for example: --dataset-tokenizer-name gpt2)."
+            )
+        try:
+            from transformers import AutoTokenizer  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "transformers tokenizer requested but package is not installed. "
+                "Install with: python -m pip install 'transformers>=4.46.0'"
+            ) from exc
+
+        try:
+            hf_tok = AutoTokenizer.from_pretrained(
+                tokenizer_name, use_fast=True, trust_remote_code=False
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load transformers tokenizer {tokenizer_name!r}."
+            ) from exc
+
+        return lambda text: _remap_external_token_ids_to_vocab(
+            hf_tok.encode(text, add_special_tokens=False),
+            vocab_size=vocab_size,
+            max_doc_tokens=max_doc_tokens,
+        )
+
+    raise ValueError(
+        f"Unsupported tokenizer backend {backend!r}. "
+        "Choose from: hash, tiktoken, hf_auto."
+    )
+
+
 def _extract_text(example: Mapping[str, Any], text_keys: Sequence[str]) -> Optional[str]:
     for key in text_keys:
         value = example.get(key)
@@ -836,8 +936,7 @@ def _collect_stream_token_ids(
     text_iter: Iterator[str],
     *,
     required_tokens: int,
-    vocab_size: int,
-    max_doc_tokens: int,
+    tokenize_text: Callable[[str], List[int]],
     max_docs: Optional[int],
     progress_label: str,
 ) -> Tuple[jnp.ndarray, int]:
@@ -847,13 +946,7 @@ def _collect_stream_token_ids(
     for text in text_iter:
         try:
             docs_seen += 1
-            flat_tokens.extend(
-                _text_to_ids(
-                    text,
-                    vocab_size=vocab_size,
-                    max_doc_tokens=max_doc_tokens,
-                )
-            )
+            flat_tokens.extend(tokenize_text(text))
         except ImportError as exc:
             if _is_numpy_umath_center_error(exc):
                 raise RuntimeError(
@@ -891,8 +984,8 @@ def _make_hf_stream_batches(
     num_batches: int,
     batch_size: int,
     seq_len: int,
-    vocab_size: int,
     max_docs: Optional[int],
+    tokenize_text: Callable[[str], List[int]],
 ) -> jnp.ndarray:
     required_tokens = num_batches * batch_size * seq_len
     text_iter = _make_hf_text_iterator(
@@ -907,8 +1000,7 @@ def _make_hf_stream_batches(
     flat, docs_seen = _collect_stream_token_ids(
         text_iter,
         required_tokens=required_tokens,
-        vocab_size=vocab_size,
-        max_doc_tokens=ds_cfg.max_doc_tokens,
+        tokenize_text=tokenize_text,
         max_docs=max_docs,
         progress_label=f"hf_stream[{split}]",
     )
@@ -1068,8 +1160,8 @@ def _make_hf_http_batches(
     num_batches: int,
     batch_size: int,
     seq_len: int,
-    vocab_size: int,
     max_docs: Optional[int],
+    tokenize_text: Callable[[str], List[int]],
 ) -> jnp.ndarray:
     required_tokens = num_batches * batch_size * seq_len
     text_iter = _make_hf_http_text_iterator(
@@ -1089,8 +1181,7 @@ def _make_hf_http_batches(
     flat, docs_seen = _collect_stream_token_ids(
         text_iter,
         required_tokens=required_tokens,
-        vocab_size=vocab_size,
-        max_doc_tokens=ds_cfg.max_doc_tokens,
+        tokenize_text=tokenize_text,
         max_docs=max_docs,
         progress_label=f"hf_http[{split}]",
     )
@@ -1156,6 +1247,20 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--data-source must be one of: synthetic, hf_stream, hf_http")
     if args.data_source in {"hf_stream", "hf_http"} and not args.dataset_name:
         raise ValueError("--dataset-name is required when --data-source is hf_stream or hf_http")
+    tokenizer_backend = args.dataset_tokenizer_backend.strip().lower()
+    if tokenizer_backend not in {"hash", "tiktoken", "hf_auto"}:
+        raise ValueError("--dataset-tokenizer-backend must be one of: hash, tiktoken, hf_auto")
+    tokenizer_name = args.dataset_tokenizer_name
+    if tokenizer_name is not None:
+        tokenizer_name = tokenizer_name.strip() or None
+    if (
+        args.data_source in {"hf_stream", "hf_http"}
+        and tokenizer_backend == "hf_auto"
+        and not tokenizer_name
+    ):
+        raise ValueError(
+            "--dataset-tokenizer-name is required when --dataset-tokenizer-backend=hf_auto"
+        )
 
     root = Path(__file__).resolve().parents[1]
     out_root = root / "artifacts" / "benchmarks"
@@ -1322,6 +1427,8 @@ def run(args: argparse.Namespace) -> None:
         http_cache_dir=args.dataset_http_cache_dir,
         http_cache_read=args.dataset_http_cache_read,
         http_cache_write=args.dataset_http_cache_write,
+        tokenizer_backend=tokenizer_backend,
+        tokenizer_name=tokenizer_name,
     )
     mask = _causal_mask(args.seq_len)
 
@@ -1418,9 +1525,24 @@ def run(args: argparse.Namespace) -> None:
             rare_inject_prob=args.eval_rare_token_prob,
         )
     else:
+        tokenize_text = _build_text_tokenizer(
+            backend=ds_cfg.tokenizer_backend,
+            tokenizer_name=ds_cfg.tokenizer_name,
+            vocab_size=args.vocab_size,
+            max_doc_tokens=ds_cfg.max_doc_tokens,
+        )
         print(
             "Using real-world text stream dataset: "
             f"{ds_cfg.name} [{ds_cfg.config or 'default'}]"
+        )
+        tokenizer_name_display = (
+            ds_cfg.tokenizer_name
+            if ds_cfg.tokenizer_name
+            else ("cl100k_base" if ds_cfg.tokenizer_backend == "tiktoken" else "<default>")
+        )
+        print(
+            "Dataset tokenizer: "
+            f"backend={ds_cfg.tokenizer_backend}, name={tokenizer_name_display}"
         )
         if args.data_source == "hf_http":
             token_present = bool(ds_cfg.http_token_env and os.environ.get(ds_cfg.http_token_env))
@@ -1440,8 +1562,8 @@ def run(args: argparse.Namespace) -> None:
                 num_batches=train_pool_batches,
                 batch_size=args.batch_size,
                 seq_len=args.seq_len,
-                vocab_size=args.vocab_size,
                 max_docs=ds_cfg.train_max_docs,
+                tokenize_text=tokenize_text,
             )
 
             def build_eval(split_name: str, seed_val: int):
@@ -1452,8 +1574,8 @@ def run(args: argparse.Namespace) -> None:
                     num_batches=args.eval_batches,
                     batch_size=args.batch_size,
                     seq_len=args.seq_len,
-                    vocab_size=args.vocab_size,
                     max_docs=ds_cfg.eval_max_docs,
+                    tokenize_text=tokenize_text,
                 )
 
         else:
@@ -1463,8 +1585,8 @@ def run(args: argparse.Namespace) -> None:
                 num_batches=train_pool_batches,
                 batch_size=args.batch_size,
                 seq_len=args.seq_len,
-                vocab_size=args.vocab_size,
                 max_docs=ds_cfg.train_max_docs,
+                tokenize_text=tokenize_text,
             )
 
             def build_eval(split_name: str, seed_val: int):
@@ -1475,8 +1597,8 @@ def run(args: argparse.Namespace) -> None:
                     num_batches=args.eval_batches,
                     batch_size=args.batch_size,
                     seq_len=args.seq_len,
-                    vocab_size=args.vocab_size,
                     max_docs=ds_cfg.eval_max_docs,
+                    tokenize_text=tokenize_text,
                 )
 
         try:
@@ -2091,6 +2213,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dataset-train-split", type=str, default="train")
     p.add_argument("--dataset-eval-split", type=str, default="validation")
     p.add_argument("--dataset-text-keys", type=str, default="text,content,document")
+    p.add_argument("--dataset-tokenizer-backend", type=str, default="tiktoken")
+    p.add_argument("--dataset-tokenizer-name", type=str, default=None)
     p.add_argument("--dataset-shuffle-buffer", type=int, default=10000)
     p.add_argument("--dataset-max-doc-tokens", type=int, default=512)
     p.add_argument("--dataset-train-max-docs", type=int, default=None)
