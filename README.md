@@ -139,6 +139,44 @@ python scripts/run_benchmarks.py \
   --train-pool-refresh-interval 250
 ```
 
+Colab TPU v6e1 100M-token all-ablation run (~140M model, 5 configs):
+```bash
+python scripts/run_benchmarks.py \
+  --data-source hf_http \
+  --dataset-name HuggingFaceFW/fineweb \
+  --dataset-config sample-10BT \
+  --dataset-tokenizer-backend tiktoken \
+  --dataset-tokenizer-name cl100k_base \
+  --dataset-token-id-projection table \
+  --dataset-eval-holdout-fraction 0.01 \
+  --configs baseline,lora_hook_only,hyperball_ungrouped,hyperball_grouped,hyperball_grouped_lora \
+  --target-train-tokens 100000000 \
+  --steps 2000 \
+  --max-steps 30000 \
+  --batch-size 8 \
+  --seq-len 1024 \
+  --width 768 \
+  --num-layers 12 \
+  --num-heads 12 \
+  --vocab-size 32768 \
+  --hardware-aware \
+  --max-tokens-per-step 12288 \
+  --max-logits-elements 268435456 \
+  --max-attention-elements 100663296 \
+  --eval-interval 500 \
+  --eval-batches 4 \
+  --inference-sampler-interval 500 \
+  --inference-sampler-temperature 1.0 \
+  --hellaswag-eval-interval 500 \
+  --hellaswag-max-examples 256 \
+  --train-pool-refresh-interval 250 \
+  --lr 3e-4 \
+  --lr-schedule warmup_cosine \
+  --lr-warmup-steps 1000 \
+  --lr-min-ratio 0.10 \
+  --lr-total-steps 30000
+```
+
 Build benchmark report from CSV artifacts:
 ```bash
 python -m pip install -e ".[report]"
