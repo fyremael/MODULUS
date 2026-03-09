@@ -112,6 +112,21 @@ class DatasetConfig:
     tokenizer_name: Optional[str]
 
 
+@dataclass(frozen=True)
+class TextTokenizerAdapter:
+    encode_text: Callable[[str], List[int]]
+    decode_tokens: Optional[Callable[[Sequence[int]], str]]
+    backend: str
+    name: Optional[str]
+
+
+@dataclass(frozen=True)
+class HellaSwagExample:
+    context: str
+    endings: Tuple[str, ...]
+    label: int
+
+
 def _layer_norm(x: jnp.ndarray, scale: jnp.ndarray, eps: float = 1e-5) -> jnp.ndarray:
     x_dtype = x.dtype
     x32 = x.astype(jnp.float32)
@@ -562,6 +577,289 @@ def _make_eval_fn(
     return jax.jit(eval_fn)
 
 
+def _make_logits_fn(*, model_cfg: ModelConfig, causal_mask: jnp.ndarray):
+    def logits_fn(params, tokens):
+        return _model_forward(
+            params,
+            tokens,
+            model_cfg=model_cfg,
+            causal_mask=causal_mask,
+            use_lora=True,
+        ).astype(jnp.float32)
+
+    return jax.jit(logits_fn)
+
+
+def _strip_wrapped_special_tokens(token_ids: Sequence[int]) -> List[int]:
+    ids = list(int(t) for t in token_ids)
+    if len(ids) >= 2 and ids[0] == 1 and ids[-1] == 2:
+        return ids[1:-1]
+    return ids
+
+
+def _decode_tokens_for_log(
+    decode_fn: Optional[Callable[[Sequence[int]], str]],
+    token_ids: Sequence[int],
+) -> str:
+    if decode_fn is None:
+        preview = ", ".join(str(int(t)) for t in list(token_ids)[:64])
+        return f"[token_ids] {preview}"
+    try:
+        return decode_fn(token_ids)
+    except Exception:
+        preview = ", ".join(str(int(t)) for t in list(token_ids)[:64])
+        return f"[decode_error token_ids] {preview}"
+
+
+def _default_sampler_prompts() -> Tuple[str, ...]:
+    return (
+        "The future of AI research will focus on",
+        "In a surprising turn of events, the team discovered",
+        "A practical systems engineering lesson is that",
+    )
+
+
+def _run_temperature_sampler(
+    *,
+    params: Mapping[str, Any],
+    logits_fn: Callable[[Any, jnp.ndarray], jnp.ndarray],
+    tokenizer: TextTokenizerAdapter,
+    model_cfg: ModelConfig,
+    prompts: Sequence[str],
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int,
+    seed: int,
+) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    rng = jax.random.PRNGKey(seed)
+
+    for prompt in prompts:
+        prompt_ids = tokenizer.encode_text(prompt)
+        context = prompt_ids[:-1] if len(prompt_ids) >= 2 else [1]
+        if len(context) > model_cfg.seq_len - 1:
+            context = context[-(model_cfg.seq_len - 1) :]
+        generated: List[int] = []
+        t0 = time.perf_counter()
+
+        for _ in range(max_new_tokens):
+            seq = (context + generated)[-model_cfg.seq_len :]
+            seq_len = len(seq)
+            x = jnp.zeros((1, model_cfg.seq_len), dtype=jnp.int32)
+            x = x.at[0, :seq_len].set(jnp.asarray(seq, dtype=jnp.int32))
+            logits = logits_fn(params, x)
+            next_logits = logits[0, seq_len - 1, :]
+            if temperature <= 0.0:
+                next_id = int(jnp.argmax(next_logits))
+            else:
+                scaled = next_logits / max(float(temperature), 1e-6)
+                rng, subk = jax.random.split(rng)
+                if top_k > 0 and top_k < scaled.shape[-1]:
+                    vals, idx = jax.lax.top_k(scaled, top_k)
+                    pick = int(jax.random.categorical(subk, vals))
+                    next_id = int(idx[pick])
+                else:
+                    next_id = int(jax.random.categorical(subk, scaled))
+            generated.append(next_id)
+            if next_id == 2:
+                break
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        full_ids = (context + generated)[-model_cfg.seq_len :]
+        prompt_text = _decode_tokens_for_log(tokenizer.decode_tokens, context)
+        generated_text = _decode_tokens_for_log(tokenizer.decode_tokens, generated)
+        full_text = _decode_tokens_for_log(tokenizer.decode_tokens, full_ids)
+        results.append(
+            {
+                "prompt": prompt,
+                "prompt_token_count": len(context),
+                "generated_token_count": len(generated),
+                "prompt_tokens": context,
+                "generated_tokens": generated,
+                "full_tokens": full_ids,
+                "prompt_decoded": prompt_text,
+                "generated_decoded": generated_text,
+                "full_decoded": full_text,
+                "sample_ms": elapsed_ms,
+            }
+        )
+    return results
+
+
+def _load_hellaswag_examples_http(
+    *,
+    endpoint: str,
+    dataset_name: str,
+    dataset_config: Optional[str],
+    split: str,
+    max_examples: int,
+    max_retries: int,
+    min_interval_sec: float,
+    token_env: str,
+) -> List[HellaSwagExample]:
+    examples: List[HellaSwagExample] = []
+    offset = 0
+    page_len = min(max(max_examples, 1), 100)
+    token = os.environ.get(token_env) if token_env else None
+    headers = {"accept": "application/json", "user-agent": "modulus-hellaswag/1.0"}
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    endpoint = endpoint.rstrip("/")
+
+    while len(examples) < max_examples:
+        query = {
+            "dataset": dataset_name,
+            "split": split,
+            "offset": offset,
+            "length": min(page_len, max_examples - len(examples)),
+        }
+        if dataset_config:
+            query["config"] = dataset_config
+        url = f"{endpoint}?{urllib.parse.urlencode(query)}"
+        payload: Dict[str, Any] | None = None
+        last_error: Optional[BaseException] = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                if exc.code == 429 and attempt < max_retries:
+                    backoff = max(min_interval_sec, 2.0 * (attempt + 1)) + random.uniform(0.0, 0.5)
+                    time.sleep(backoff)
+                    continue
+                if attempt >= max_retries:
+                    break
+                time.sleep(max(min_interval_sec, 1.0 + attempt))
+            except Exception as exc:
+                last_error = exc
+                if attempt >= max_retries:
+                    break
+                time.sleep(max(min_interval_sec, 1.5 * (attempt + 1)))
+
+        if payload is None:
+            raise RuntimeError(f"Failed to fetch HellaSwag rows from {url}: {last_error}")
+
+        rows = payload.get("rows", [])
+        if not isinstance(rows, list) or len(rows) == 0:
+            break
+
+        for row in rows:
+            example = row.get("row", row) if isinstance(row, Mapping) else None
+            if not isinstance(example, Mapping):
+                continue
+            endings_raw = example.get("endings")
+            label_raw = example.get("label")
+            ctx = example.get("ctx")
+            if not isinstance(ctx, str):
+                ctx_a = example.get("ctx_a")
+                ctx_b = example.get("ctx_b")
+                if isinstance(ctx_a, str) and isinstance(ctx_b, str):
+                    ctx = (ctx_a + " " + ctx_b).strip()
+            if not isinstance(ctx, str) or not ctx.strip():
+                continue
+            if not isinstance(endings_raw, Sequence):
+                continue
+            endings = tuple(str(e) for e in endings_raw if isinstance(e, str))
+            if len(endings) < 2:
+                continue
+            try:
+                label = int(label_raw)
+            except Exception:
+                continue
+            if label < 0 or label >= len(endings):
+                continue
+            examples.append(HellaSwagExample(context=ctx, endings=endings, label=label))
+            if len(examples) >= max_examples:
+                break
+
+        offset += len(rows)
+        if min_interval_sec > 0:
+            time.sleep(min_interval_sec)
+
+    if not examples:
+        raise RuntimeError("Loaded zero valid HellaSwag examples.")
+    return examples
+
+
+def _build_hellaswag_candidate(
+    *,
+    context_ids: Sequence[int],
+    ending_ids: Sequence[int],
+    seq_len: int,
+) -> Tuple[List[int], int, int]:
+    ctx = list(context_ids)
+    ending = list(ending_ids) + [2]
+    max_body = max(seq_len - 1, 1)
+
+    overflow = (len(ctx) + len(ending)) - max_body
+    if overflow > 0:
+        if overflow < len(ctx):
+            ctx = ctx[overflow:]
+        else:
+            overflow_after_ctx = overflow - len(ctx)
+            ctx = []
+            if overflow_after_ctx > 0:
+                ending = ending[overflow_after_ctx:]
+            if not ending:
+                ending = [2]
+
+    seq = [1] + ctx + ending
+    target_start = 1 + len(ctx)
+    target_len = len(ending)
+    return seq, target_start, target_len
+
+
+def _evaluate_hellaswag_accuracy(
+    *,
+    params: Mapping[str, Any],
+    logits_fn: Callable[[Any, jnp.ndarray], jnp.ndarray],
+    tokenizer: TextTokenizerAdapter,
+    model_cfg: ModelConfig,
+    examples: Sequence[HellaSwagExample],
+) -> float:
+    correct = 0
+    total = 0
+
+    for ex in examples:
+        ctx_ids = _strip_wrapped_special_tokens(tokenizer.encode_text(ex.context))
+        cand_payload: List[Tuple[List[int], int, int]] = []
+        for ending in ex.endings:
+            ending_ids = _strip_wrapped_special_tokens(tokenizer.encode_text(ending))
+            cand_payload.append(
+                _build_hellaswag_candidate(
+                    context_ids=ctx_ids,
+                    ending_ids=ending_ids,
+                    seq_len=model_cfg.seq_len,
+                )
+            )
+
+        batch = jnp.zeros((len(cand_payload), model_cfg.seq_len), dtype=jnp.int32)
+        for i, (seq, _, _) in enumerate(cand_payload):
+            batch = batch.at[i, : len(seq)].set(jnp.asarray(seq, dtype=jnp.int32))
+
+        logits = logits_fn(params, batch)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        scores: List[float] = []
+        for i, (seq, target_start, target_len) in enumerate(cand_payload):
+            pos = jnp.arange(target_start - 1, target_start - 1 + target_len, dtype=jnp.int32)
+            tgt = jnp.asarray(seq[target_start : target_start + target_len], dtype=jnp.int32)
+            tok_lp = log_probs[i, pos, tgt]
+            scores.append(float(jnp.mean(tok_lp)))
+
+        pred = int(max(range(len(scores)), key=lambda idx: scores[idx]))
+        if pred == ex.label:
+            correct += 1
+        total += 1
+
+    if total == 0:
+        return float("nan")
+    return correct / float(total)
+
+
 def _timestamp_dir(base_dir: Path) -> Path:
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = base_dir / ts
@@ -880,11 +1178,16 @@ def _build_text_tokenizer(
     tokenizer_name: Optional[str],
     vocab_size: int,
     max_doc_tokens: int,
-) -> Callable[[str], List[int]]:
+) -> TextTokenizerAdapter:
     backend_norm = backend.strip().lower()
     if backend_norm == "hash":
-        return lambda text: _text_to_ids(
-            text, vocab_size=vocab_size, max_doc_tokens=max_doc_tokens
+        return TextTokenizerAdapter(
+            encode_text=lambda text: _text_to_ids(
+                text, vocab_size=vocab_size, max_doc_tokens=max_doc_tokens
+            ),
+            decode_tokens=None,
+            backend=backend_norm,
+            name=tokenizer_name,
         )
 
     if backend_norm == "tiktoken":
@@ -914,10 +1217,19 @@ def _build_text_tokenizer(
         else:
             encode = lambda s: encoding.encode(s, disallowed_special=())  # noqa: E731
 
-        return lambda text: _remap_external_token_ids_to_vocab(
-            encode(text),
-            vocab_size=vocab_size,
-            max_doc_tokens=max_doc_tokens,
+        def decode_tokens(token_ids: Sequence[int]) -> str:
+            toks = [int(t) for t in token_ids]
+            return encoding.decode(toks)
+
+        return TextTokenizerAdapter(
+            encode_text=lambda text: _remap_external_token_ids_to_vocab(
+                encode(text),
+                vocab_size=vocab_size,
+                max_doc_tokens=max_doc_tokens,
+            ),
+            decode_tokens=decode_tokens,
+            backend=backend_norm,
+            name=name,
         )
 
     if backend_norm == "hf_auto":
@@ -943,10 +1255,18 @@ def _build_text_tokenizer(
                 f"Failed to load transformers tokenizer {tokenizer_name!r}."
             ) from exc
 
-        return lambda text: _remap_external_token_ids_to_vocab(
-            hf_tok.encode(text, add_special_tokens=False),
-            vocab_size=vocab_size,
-            max_doc_tokens=max_doc_tokens,
+        def decode_tokens(token_ids: Sequence[int]) -> str:
+            return hf_tok.decode([int(t) for t in token_ids], skip_special_tokens=False)
+
+        return TextTokenizerAdapter(
+            encode_text=lambda text: _remap_external_token_ids_to_vocab(
+                hf_tok.encode(text, add_special_tokens=False),
+                vocab_size=vocab_size,
+                max_doc_tokens=max_doc_tokens,
+            ),
+            decode_tokens=decode_tokens,
+            backend=backend_norm,
+            name=tokenizer_name,
         )
 
     raise ValueError(
@@ -1388,6 +1708,20 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--telemetry-memory-interval must be >= 1")
     if args.profile_server_port < 0:
         raise ValueError("--profile-server-port must be >= 0")
+    if args.inference_sampler_interval < 0:
+        raise ValueError("--inference-sampler-interval must be >= 0")
+    if args.inference_sampler_num_prompts < 1:
+        raise ValueError("--inference-sampler-num-prompts must be >= 1")
+    if args.inference_sampler_max_new_tokens < 1:
+        raise ValueError("--inference-sampler-max-new-tokens must be >= 1")
+    if args.inference_sampler_temperature < 0:
+        raise ValueError("--inference-sampler-temperature must be >= 0")
+    if args.inference_sampler_top_k < 0:
+        raise ValueError("--inference-sampler-top-k must be >= 0")
+    if args.hellaswag_eval_interval < 0:
+        raise ValueError("--hellaswag-eval-interval must be >= 0")
+    if args.hellaswag_max_examples < 1:
+        raise ValueError("--hellaswag-max-examples must be >= 1")
     if not (0.0 <= args.dataset_eval_holdout_fraction < 1.0):
         raise ValueError("--dataset-eval-holdout-fraction must be in [0, 1)")
     if (
@@ -1687,6 +2021,7 @@ def run(args: argparse.Namespace) -> None:
         )
     else:
         teacher_params = {}
+    tokenizer_adapter: Optional[TextTokenizerAdapter] = None
     if args.data_source == "synthetic":
         train_tokens = _make_token_batches(
             k_train,
@@ -1707,12 +2042,13 @@ def run(args: argparse.Namespace) -> None:
             rare_inject_prob=args.eval_rare_token_prob,
         )
     else:
-        tokenize_text = _build_text_tokenizer(
+        tokenizer_adapter = _build_text_tokenizer(
             backend=ds_cfg.tokenizer_backend,
             tokenizer_name=ds_cfg.tokenizer_name,
             vocab_size=args.vocab_size,
             max_doc_tokens=ds_cfg.max_doc_tokens,
         )
+        tokenize_text = tokenizer_adapter.encode_text
         holdout_fraction = float(args.dataset_eval_holdout_fraction)
         train_eval_same_split = ds_cfg.train_split == ds_cfg.eval_split
         train_partition_mode = (
@@ -1726,8 +2062,8 @@ def run(args: argparse.Namespace) -> None:
             f"{ds_cfg.name} [{ds_cfg.config or 'default'}]"
         )
         tokenizer_name_display = (
-            ds_cfg.tokenizer_name
-            if ds_cfg.tokenizer_name
+            tokenizer_adapter.name
+            if tokenizer_adapter.name
             else ("cl100k_base" if ds_cfg.tokenizer_backend == "tiktoken" else "<default>")
         )
         print(
@@ -1836,11 +2172,69 @@ def run(args: argparse.Namespace) -> None:
             else:
                 raise
 
+    sampler_enabled = args.inference_sampler_interval > 0
+    hellaswag_enabled = args.hellaswag_eval_interval > 0
+    if (sampler_enabled or hellaswag_enabled) and tokenizer_adapter is None:
+        tokenizer_adapter = _build_text_tokenizer(
+            backend=ds_cfg.tokenizer_backend,
+            tokenizer_name=ds_cfg.tokenizer_name,
+            vocab_size=args.vocab_size,
+            max_doc_tokens=ds_cfg.max_doc_tokens,
+        )
+
+    hellaswag_examples: List[HellaSwagExample] = []
+    if hellaswag_enabled:
+        try:
+            hellaswag_examples = _load_hellaswag_examples_http(
+                endpoint=args.dataset_rows_endpoint,
+                dataset_name=args.hellaswag_dataset_name,
+                dataset_config=args.hellaswag_dataset_config,
+                split=args.hellaswag_split,
+                max_examples=args.hellaswag_max_examples,
+                max_retries=args.dataset_http_max_retries,
+                min_interval_sec=args.dataset_http_min_interval_sec,
+                token_env=args.dataset_http_token_env,
+            )
+            print(
+                f"HellaSwag loaded: {len(hellaswag_examples)} examples "
+                f"from {args.hellaswag_dataset_name} [{args.hellaswag_split}]"
+            )
+        except Exception as exc:
+            print(f"WARNING: failed to load HellaSwag dataset; disabling HellaSwag eval ({exc})")
+            hellaswag_enabled = False
+
+    sampler_prompts: Tuple[str, ...] = ()
+    if args.inference_sampler_prompts.strip():
+        sampler_prompts = tuple(
+            p.strip() for p in args.inference_sampler_prompts.split("|||") if p.strip()
+        )
+    if not sampler_prompts:
+        if hellaswag_examples:
+            sampler_prompts = tuple(
+                ex.context for ex in hellaswag_examples[: args.inference_sampler_num_prompts]
+            )
+        else:
+            sampler_prompts = _default_sampler_prompts()[: args.inference_sampler_num_prompts]
+    if sampler_enabled and len(sampler_prompts) == 0:
+        print("WARNING: no prompts resolved for inference sampler; disabling sampler.")
+        sampler_enabled = False
+
+    sample_jsonl_path: Optional[Path] = None
+    if sampler_enabled:
+        sample_jsonl_path = (
+            Path(args.inference_sampler_jsonl)
+            if args.inference_sampler_jsonl
+            else (out_dir / "inference_samples.jsonl")
+        )
+        sample_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+
     print(
         "Instrumentation: "
         f"compile_heartbeat_sec={args.compile_heartbeat_sec}, "
         f"telemetry_memory_interval={args.telemetry_memory_interval}, "
-        f"profile_trace={args.profile_trace}"
+        f"profile_trace={args.profile_trace}, "
+        f"inference_sampler_interval={args.inference_sampler_interval}, "
+        f"hellaswag_eval_interval={args.hellaswag_eval_interval}"
     )
 
     step_csv = out_dir / "benchmark_steps.csv"
@@ -1864,6 +2258,10 @@ def run(args: argparse.Namespace) -> None:
         "update_norm",
         "learning_rate",
         "eval_ms",
+        "hellaswag_acc",
+        "hellaswag_ms",
+        "sampler_ms",
+        "sampler_num_prompts",
         "eval_loss",
         "eval_next_token_ce",
         "eval_distill_kl",
@@ -1944,6 +2342,7 @@ def run(args: argparse.Namespace) -> None:
                     objective_cfg=objective_cfg,
                     causal_mask=mask,
                 )
+                logits_fn = _make_logits_fn(model_cfg=model_cfg, causal_mask=mask)
                 print("  - jit: functions created")
 
                 # JIT warmup (excluded from timing rows).
@@ -2050,6 +2449,55 @@ def run(args: argparse.Namespace) -> None:
             min_steps_cfg = max(args.steps, target_token_steps_cfg)
             target_seconds = args.target_runtime_minutes * 60.0
             max_steps = args.max_steps
+
+            hellaswag_acc_last = float("nan")
+            hellaswag_acc_best = float("nan")
+            if hellaswag_enabled and tokenizer_adapter is not None and len(hellaswag_examples) > 0:
+                hs_t0 = time.perf_counter()
+                hellaswag_acc_last = _evaluate_hellaswag_accuracy(
+                    params=params,
+                    logits_fn=logits_fn,
+                    tokenizer=tokenizer_adapter,
+                    model_cfg=model_cfg,
+                    examples=hellaswag_examples,
+                )
+                hs_ms = (time.perf_counter() - hs_t0) * 1000.0
+                hellaswag_acc_best = hellaswag_acc_last
+                print(
+                    f"  - eval: start HellaSwag acc={hellaswag_acc_last:.4f} "
+                    f"on {len(hellaswag_examples)} examples ({hs_ms:.2f}ms)"
+                )
+
+            if sampler_enabled and tokenizer_adapter is not None and len(sampler_prompts) > 0:
+                sample_records = _run_temperature_sampler(
+                    params=params,
+                    logits_fn=logits_fn,
+                    tokenizer=tokenizer_adapter,
+                    model_cfg=model_cfg,
+                    prompts=sampler_prompts,
+                    max_new_tokens=args.inference_sampler_max_new_tokens,
+                    temperature=args.inference_sampler_temperature,
+                    top_k=args.inference_sampler_top_k,
+                    seed=args.seed + 12345,
+                )
+                if sample_jsonl_path is not None:
+                    with sample_jsonl_path.open("a", encoding="utf-8") as f:
+                        for rec in sample_records:
+                            payload = {
+                                "config": cfg.name,
+                                "step": 0,
+                                "temperature": args.inference_sampler_temperature,
+                                "record": rec,
+                            }
+                            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                if sample_records:
+                    preview = sample_records[0]["generated_decoded"].replace("\n", " ").strip()
+                    print(
+                        "  - sample@start: "
+                        f"prompt={sample_records[0]['prompt']!r} "
+                        f"gen={preview[:160]!r}"
+                    )
+
             run_t0 = time.perf_counter()
 
             loss_last = float("nan")
@@ -2063,6 +2511,10 @@ def run(args: argparse.Namespace) -> None:
             tokens_per_s_total = 0.0
             eval_ms_total = 0.0
             eval_events = 0
+            hellaswag_ms_total = 0.0
+            hellaswag_events = 0
+            sampler_ms_total = 0.0
+            sampler_events = 0
             grad_norm_total = 0.0
             update_norm_total = 0.0
             learning_rate_total = 0.0
@@ -2108,6 +2560,10 @@ def run(args: argparse.Namespace) -> None:
                 eval_ce = float("nan")
                 eval_kl = float("nan")
                 eval_ms = float("nan")
+                hellaswag_acc = hellaswag_acc_last
+                hellaswag_ms = float("nan")
+                sampler_ms = float("nan")
+                sampler_num_prompts = 0
                 should_eval = args.eval_interval > 0 and (
                     (step + 1) % args.eval_interval == 0 or step == (args.steps - 1)
                 )
@@ -2134,9 +2590,76 @@ def run(args: argparse.Namespace) -> None:
                     final_eval_loss = eval_loss
                     best_eval_loss = min(best_eval_loss, eval_loss)
 
+                should_hellaswag = hellaswag_enabled and (
+                    (args.hellaswag_eval_interval > 0)
+                    and (((step + 1) % args.hellaswag_eval_interval == 0) or step == 0)
+                )
+                if (
+                    should_hellaswag
+                    and tokenizer_adapter is not None
+                    and len(hellaswag_examples) > 0
+                ):
+                    hs_t0 = time.perf_counter()
+                    hellaswag_acc = _evaluate_hellaswag_accuracy(
+                        params=params,
+                        logits_fn=logits_fn,
+                        tokenizer=tokenizer_adapter,
+                        model_cfg=model_cfg,
+                        examples=hellaswag_examples,
+                    )
+                    hellaswag_ms = (time.perf_counter() - hs_t0) * 1000.0
+                    hellaswag_acc_last = hellaswag_acc
+                    if math.isnan(hellaswag_acc_best):
+                        hellaswag_acc_best = hellaswag_acc
+                    else:
+                        hellaswag_acc_best = max(hellaswag_acc_best, hellaswag_acc)
+
+                should_sample = sampler_enabled and (
+                    (args.inference_sampler_interval > 0)
+                    and (((step + 1) % args.inference_sampler_interval == 0) or step == 0)
+                )
+                if should_sample and tokenizer_adapter is not None and len(sampler_prompts) > 0:
+                    sample_t0 = time.perf_counter()
+                    sample_records = _run_temperature_sampler(
+                        params=params,
+                        logits_fn=logits_fn,
+                        tokenizer=tokenizer_adapter,
+                        model_cfg=model_cfg,
+                        prompts=sampler_prompts,
+                        max_new_tokens=args.inference_sampler_max_new_tokens,
+                        temperature=args.inference_sampler_temperature,
+                        top_k=args.inference_sampler_top_k,
+                        seed=args.seed + (step_count + 1) * 17,
+                    )
+                    sampler_ms = (time.perf_counter() - sample_t0) * 1000.0
+                    sampler_num_prompts = len(sample_records)
+                    if sample_jsonl_path is not None:
+                        with sample_jsonl_path.open("a", encoding="utf-8") as f:
+                            for rec in sample_records:
+                                hellaswag_json = (
+                                    None if math.isnan(hellaswag_acc_last) else hellaswag_acc_last
+                                )
+                                payload = {
+                                    "config": cfg.name,
+                                    "step": step_count + 1,
+                                    "temperature": args.inference_sampler_temperature,
+                                    "hellaswag_acc": hellaswag_json,
+                                    "record": rec,
+                                }
+                                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                    if sample_records:
+                        preview = sample_records[0]["generated_decoded"].replace("\n", " ").strip()
+                        print(
+                            f"  - sample@step{step_count + 1}: "
+                            f"prompt={sample_records[0]['prompt']!r} "
+                            f"gen={preview[:160]!r}"
+                        )
+
                 telemetry_due = (
                     step_count == 0
                     or should_eval
+                    or should_hellaswag
+                    or should_sample
                     or (step_count % args.telemetry_memory_interval == 0)
                 )
                 if telemetry_due:
@@ -2163,6 +2686,10 @@ def run(args: argparse.Namespace) -> None:
                     "update_norm": f"{update_norm_scalar:.8f}",
                     "learning_rate": f"{learning_rate_scalar:.10f}",
                     "eval_ms": f"{eval_ms:.4f}",
+                    "hellaswag_acc": f"{hellaswag_acc_last:.6f}",
+                    "hellaswag_ms": f"{hellaswag_ms:.4f}",
+                    "sampler_ms": f"{sampler_ms:.4f}",
+                    "sampler_num_prompts": sampler_num_prompts,
                     "eval_loss": f"{eval_loss:.8f}",
                     "eval_next_token_ce": f"{eval_ce:.8f}",
                     "eval_distill_kl": f"{eval_kl:.8f}",
@@ -2198,6 +2725,12 @@ def run(args: argparse.Namespace) -> None:
                 if should_eval and not math.isnan(eval_ms):
                     eval_ms_total += eval_ms
                     eval_events += 1
+                if should_hellaswag and not math.isnan(hellaswag_ms):
+                    hellaswag_ms_total += hellaswag_ms
+                    hellaswag_events += 1
+                if should_sample and not math.isnan(sampler_ms):
+                    sampler_ms_total += sampler_ms
+                    sampler_events += 1
                 grad_norm_total += grad_norm_scalar
                 update_norm_total += update_norm_scalar
                 learning_rate_total += learning_rate_scalar
@@ -2270,6 +2803,14 @@ def run(args: argparse.Namespace) -> None:
                         progress_parts.append(f"val_kl={_fmt_metric(eval_kl, 6)}")
                         progress_parts.append(f"eval_ms={_fmt_metric(eval_ms, 2)}")
                         progress_parts.append(f"best_val={_fmt_metric(best_eval_loss, 6)}")
+                    if not math.isnan(hellaswag_acc_last):
+                        progress_parts.append(
+                            f"hellaswag_acc={_fmt_metric(hellaswag_acc_last, 4)}"
+                        )
+                    if should_hellaswag and not math.isnan(hellaswag_ms):
+                        progress_parts.append(f"hellaswag_ms={_fmt_metric(hellaswag_ms, 2)}")
+                    if should_sample and not math.isnan(sampler_ms):
+                        progress_parts.append(f"sampler_ms={_fmt_metric(sampler_ms, 2)}")
                     progress_parts.append(f"host_rss_gb={_fmt_metric(host_rss_last, 3)}")
                     if not math.isnan(device_mem_inuse_last):
                         progress_parts.append(
@@ -2353,6 +2894,10 @@ def run(args: argparse.Namespace) -> None:
                 "avg_sync_ms": f"{(sync_ms_total / max(step_count, 1)):.4f}",
                 "avg_tokens_per_s": f"{(tokens_per_s_total / max(step_count, 1)):.2f}",
                 "avg_eval_ms": f"{(eval_ms_total / max(eval_events, 1)):.4f}",
+                "final_hellaswag_acc": f"{hellaswag_acc_last:.6f}",
+                "best_hellaswag_acc": f"{hellaswag_acc_best:.6f}",
+                "avg_hellaswag_ms": f"{(hellaswag_ms_total / max(hellaswag_events, 1)):.4f}",
+                "avg_sampler_ms": f"{(sampler_ms_total / max(sampler_events, 1)):.4f}",
                 "avg_grad_norm": f"{(grad_norm_total / max(step_count, 1)):.8f}",
                 "avg_update_norm": f"{(update_norm_total / max(step_count, 1)):.8f}",
                 "avg_learning_rate": f"{(learning_rate_total / max(step_count, 1)):.10f}",
@@ -2410,6 +2955,10 @@ def run(args: argparse.Namespace) -> None:
             "avg_sync_ms",
             "avg_tokens_per_s",
             "avg_eval_ms",
+            "final_hellaswag_acc",
+            "best_hellaswag_acc",
+            "avg_hellaswag_ms",
+            "avg_sampler_ms",
             "avg_grad_norm",
             "avg_update_norm",
             "avg_learning_rate",
@@ -2462,6 +3011,20 @@ def run(args: argparse.Namespace) -> None:
         "profile_trace_dir": str(trace_dir),
         "profile_server_port": args.profile_server_port,
         "profile_server_started": profiler_server_started,
+        "inference_sampler_interval": args.inference_sampler_interval,
+        "inference_sampler_num_prompts": args.inference_sampler_num_prompts,
+        "inference_sampler_max_new_tokens": args.inference_sampler_max_new_tokens,
+        "inference_sampler_temperature": args.inference_sampler_temperature,
+        "inference_sampler_top_k": args.inference_sampler_top_k,
+        "inference_sampler_jsonl": str(sample_jsonl_path) if sample_jsonl_path else None,
+        "inference_sampler_prompts": list(sampler_prompts),
+        "hellaswag_eval_interval": args.hellaswag_eval_interval,
+        "hellaswag_max_examples": args.hellaswag_max_examples,
+        "hellaswag_dataset_name": args.hellaswag_dataset_name,
+        "hellaswag_dataset_config": args.hellaswag_dataset_config,
+        "hellaswag_split": args.hellaswag_split,
+        "hellaswag_enabled": hellaswag_enabled,
+        "hellaswag_examples_loaded": len(hellaswag_examples),
         "auto_seq_len_by_memory": args.auto_seq_len_by_memory,
         "auto_disable_distill_for_memory": args.auto_disable_distill_for_memory,
         "distill_disable_param_threshold": args.distill_disable_param_threshold,
@@ -2511,6 +3074,7 @@ def run(args: argparse.Namespace) -> None:
             f"avg_step_ms={r['avg_step_ms']}, "
             f"avg_dispatch_ms={r['avg_dispatch_ms']}, avg_sync_ms={r['avg_sync_ms']}, "
             f"avg_tokens_per_s={r['avg_tokens_per_s']}, "
+            f"final_hellaswag_acc={r['final_hellaswag_acc']}, "
             f"warmup_compile_estimate_s={r['warmup_compile_estimate_s']}, "
             f"angle={angle}, radial={radial}"
         )
@@ -2594,6 +3158,18 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--profile-trace-dir", type=str, default=None)
     p.add_argument("--profile-server-port", type=int, default=0)
+    p.add_argument("--inference-sampler-interval", type=int, default=0)
+    p.add_argument("--inference-sampler-num-prompts", type=int, default=3)
+    p.add_argument("--inference-sampler-max-new-tokens", type=int, default=48)
+    p.add_argument("--inference-sampler-temperature", type=float, default=1.0)
+    p.add_argument("--inference-sampler-top-k", type=int, default=50)
+    p.add_argument("--inference-sampler-prompts", type=str, default="")
+    p.add_argument("--inference-sampler-jsonl", type=str, default=None)
+    p.add_argument("--hellaswag-eval-interval", type=int, default=0)
+    p.add_argument("--hellaswag-max-examples", type=int, default=128)
+    p.add_argument("--hellaswag-dataset-name", type=str, default="Rowan/hellaswag")
+    p.add_argument("--hellaswag-dataset-config", type=str, default=None)
+    p.add_argument("--hellaswag-split", type=str, default="validation")
     p.add_argument("--shift-start-frac", type=float, default=0.5)
     p.add_argument("--train-rare-token-prob", type=float, default=0.03)
     p.add_argument("--eval-rare-token-prob", type=float, default=0.08)

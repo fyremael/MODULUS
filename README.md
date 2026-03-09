@@ -62,6 +62,10 @@ python scripts/run_benchmarks.py \
   --compile-retry-attempts 3 \
   --compile-heartbeat-sec 30 \
   --telemetry-memory-interval 25 \
+  --inference-sampler-interval 100 \
+  --inference-sampler-temperature 1.0 \
+  --hellaswag-eval-interval 100 \
+  --hellaswag-max-examples 128 \
   --auto-token-pool-by-host-ram \
   --host-ram-token-pool-fraction 0.20 \
   --dataset-http-cache-dir artifacts/datasets/hf_http_cache \
@@ -88,6 +92,9 @@ reduce memory and CSV size while preserving eval snapshots.
 TPU observability knobs: `--compile-heartbeat-sec` emits periodic heartbeat logs during
 first-step XLA compile, and `--telemetry-memory-interval` samples host/device memory
 proxies into `benchmark_steps.csv`.
+Progress-quality hooks: `--inference-sampler-interval` writes periodic generation samples
+to `inference_samples.jsonl` (temperature defaults to `1.0`), and
+`--hellaswag-eval-interval` tracks HellaSwag accuracy over training.
 Optional profiler capture: `--profile-trace --profile-trace-dir <path>` and/or
 `--profile-server-port <port>` for TensorBoard profiler attachment.
 Hardware-aware mode is on by default and can downshift `batch_size` or
@@ -118,7 +125,11 @@ python scripts/run_benchmarks.py \
   --lr-min-ratio 0.10 \
   --lr-total-steps 90000 \
   --compile-heartbeat-sec 30 \
-  --telemetry-memory-interval 25
+  --telemetry-memory-interval 25 \
+  --inference-sampler-interval 500 \
+  --inference-sampler-temperature 1.0 \
+  --hellaswag-eval-interval 500 \
+  --hellaswag-max-examples 256
 ```
 
 Build benchmark report from CSV artifacts:
