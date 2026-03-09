@@ -1722,6 +1722,8 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--hellaswag-eval-interval must be >= 0")
     if args.hellaswag_max_examples < 1:
         raise ValueError("--hellaswag-max-examples must be >= 1")
+    if args.train_pool_refresh_interval < 0:
+        raise ValueError("--train-pool-refresh-interval must be >= 0")
     if not (0.0 <= args.dataset_eval_holdout_fraction < 1.0):
         raise ValueError("--dataset-eval-holdout-fraction must be in [0, 1)")
     if (
@@ -2041,6 +2043,7 @@ def run(args: argparse.Namespace) -> None:
             shift_start_batch=0,
             rare_inject_prob=args.eval_rare_token_prob,
         )
+        build_train: Optional[Callable[[int, str], jnp.ndarray]] = None
     else:
         tokenizer_adapter = _build_text_tokenizer(
             backend=ds_cfg.tokenizer_backend,
@@ -2103,14 +2106,15 @@ def run(args: argparse.Namespace) -> None:
                     tokenize_text=tokenize_text,
                     partition_mode=partition_mode,
                     eval_holdout_fraction=holdout_fraction,
-                    partition_salt=args.seed + 907,
+                    partition_salt=seed_val + 907,
                 )
 
             def build_eval(split_name: str, seed_val: int, partition_mode: str) -> jnp.ndarray:
+                del seed_val
                 return _make_hf_stream_batches(
                     ds_cfg,
                     split=split_name,
-                    seed=seed_val,
+                    seed=args.seed + 29,
                     num_batches=args.eval_batches,
                     batch_size=args.batch_size,
                     seq_len=args.seq_len,
@@ -2123,7 +2127,6 @@ def run(args: argparse.Namespace) -> None:
 
         else:
             def build_train(seed_val: int, partition_mode: str) -> jnp.ndarray:
-                del seed_val
                 return _make_hf_http_batches(
                     ds_cfg,
                     split=ds_cfg.train_split,
@@ -2134,7 +2137,7 @@ def run(args: argparse.Namespace) -> None:
                     tokenize_text=tokenize_text,
                     partition_mode=partition_mode,
                     eval_holdout_fraction=holdout_fraction,
-                    partition_salt=args.seed + 907,
+                    partition_salt=seed_val + 907,
                 )
 
             def build_eval(split_name: str, seed_val: int, partition_mode: str) -> jnp.ndarray:
@@ -2234,8 +2237,18 @@ def run(args: argparse.Namespace) -> None:
         f"telemetry_memory_interval={args.telemetry_memory_interval}, "
         f"profile_trace={args.profile_trace}, "
         f"inference_sampler_interval={args.inference_sampler_interval}, "
-        f"hellaswag_eval_interval={args.hellaswag_eval_interval}"
+        f"hellaswag_eval_interval={args.hellaswag_eval_interval}, "
+        f"train_pool_refresh_interval={args.train_pool_refresh_interval}"
     )
+    if (
+        args.data_source != "synthetic"
+        and args.train_pool_refresh_interval == 0
+        and (args.target_train_tokens is not None or args.steps > (train_pool_batches * 4))
+    ):
+        print(
+            "WARNING: train_pool_refresh_interval=0 on a long real-data run can overfit a fixed "
+            "token pool and stall validation. Consider --train-pool-refresh-interval 100..500."
+        )
 
     step_csv = out_dir / "benchmark_steps.csv"
     summary_csv = out_dir / "benchmark_summary.csv"
@@ -2262,6 +2275,7 @@ def run(args: argparse.Namespace) -> None:
         "hellaswag_ms",
         "sampler_ms",
         "sampler_num_prompts",
+        "train_pool_refresh_ms",
         "eval_loss",
         "eval_next_token_ce",
         "eval_distill_kl",
@@ -2515,6 +2529,8 @@ def run(args: argparse.Namespace) -> None:
             hellaswag_events = 0
             sampler_ms_total = 0.0
             sampler_events = 0
+            train_pool_refresh_ms_total = 0.0
+            train_pool_refresh_events = 0
             grad_norm_total = 0.0
             update_norm_total = 0.0
             learning_rate_total = 0.0
@@ -2529,6 +2545,33 @@ def run(args: argparse.Namespace) -> None:
 
             while True:
                 step = step_count
+                train_pool_refresh_ms = float("nan")
+                should_refresh_train_pool = (
+                    build_train is not None
+                    and args.train_pool_refresh_interval > 0
+                    and step_count > 0
+                    and (step_count % args.train_pool_refresh_interval == 0)
+                )
+                if should_refresh_train_pool:
+                    refresh_t0 = time.perf_counter()
+                    refresh_seed = (
+                        args.seed
+                        + 11
+                        + (step_count // args.train_pool_refresh_interval) * 9973
+                    )
+                    try:
+                        train_tokens = build_train(refresh_seed, train_partition_mode)
+                        train_pool_refresh_ms = (time.perf_counter() - refresh_t0) * 1000.0
+                        print(
+                            "  - train pool refresh: "
+                            f"step={step_count}, seed={refresh_seed}, "
+                            f"ms={train_pool_refresh_ms:.2f}"
+                        )
+                    except Exception as exc:
+                        print(
+                            "WARNING: train pool refresh failed; continuing with previous pool "
+                            f"(step={step_count}, error={exc})"
+                        )
                 token_idx = (args.warmup_steps + step) % train_pool_batches
                 tokens = train_tokens[token_idx, :runtime_batch_size, :]
                 t0 = time.perf_counter()
@@ -2690,6 +2733,7 @@ def run(args: argparse.Namespace) -> None:
                     "hellaswag_ms": f"{hellaswag_ms:.4f}",
                     "sampler_ms": f"{sampler_ms:.4f}",
                     "sampler_num_prompts": sampler_num_prompts,
+                    "train_pool_refresh_ms": f"{train_pool_refresh_ms:.4f}",
                     "eval_loss": f"{eval_loss:.8f}",
                     "eval_next_token_ce": f"{eval_ce:.8f}",
                     "eval_distill_kl": f"{eval_kl:.8f}",
@@ -2731,6 +2775,9 @@ def run(args: argparse.Namespace) -> None:
                 if should_sample and not math.isnan(sampler_ms):
                     sampler_ms_total += sampler_ms
                     sampler_events += 1
+                if not math.isnan(train_pool_refresh_ms):
+                    train_pool_refresh_ms_total += train_pool_refresh_ms
+                    train_pool_refresh_events += 1
                 grad_norm_total += grad_norm_scalar
                 update_norm_total += update_norm_scalar
                 learning_rate_total += learning_rate_scalar
@@ -2811,6 +2858,10 @@ def run(args: argparse.Namespace) -> None:
                         progress_parts.append(f"hellaswag_ms={_fmt_metric(hellaswag_ms, 2)}")
                     if should_sample and not math.isnan(sampler_ms):
                         progress_parts.append(f"sampler_ms={_fmt_metric(sampler_ms, 2)}")
+                    if not math.isnan(train_pool_refresh_ms):
+                        progress_parts.append(
+                            f"train_pool_refresh_ms={_fmt_metric(train_pool_refresh_ms, 2)}"
+                        )
                     progress_parts.append(f"host_rss_gb={_fmt_metric(host_rss_last, 3)}")
                     if not math.isnan(device_mem_inuse_last):
                         progress_parts.append(
@@ -2898,6 +2949,10 @@ def run(args: argparse.Namespace) -> None:
                 "best_hellaswag_acc": f"{hellaswag_acc_best:.6f}",
                 "avg_hellaswag_ms": f"{(hellaswag_ms_total / max(hellaswag_events, 1)):.4f}",
                 "avg_sampler_ms": f"{(sampler_ms_total / max(sampler_events, 1)):.4f}",
+                "train_pool_refreshes": train_pool_refresh_events,
+                "avg_train_pool_refresh_ms": (
+                    f"{(train_pool_refresh_ms_total / max(train_pool_refresh_events, 1)):.4f}"
+                ),
                 "avg_grad_norm": f"{(grad_norm_total / max(step_count, 1)):.8f}",
                 "avg_update_norm": f"{(update_norm_total / max(step_count, 1)):.8f}",
                 "avg_learning_rate": f"{(learning_rate_total / max(step_count, 1)):.10f}",
@@ -2959,6 +3014,8 @@ def run(args: argparse.Namespace) -> None:
             "best_hellaswag_acc",
             "avg_hellaswag_ms",
             "avg_sampler_ms",
+            "train_pool_refreshes",
+            "avg_train_pool_refresh_ms",
             "avg_grad_norm",
             "avg_update_norm",
             "avg_learning_rate",
@@ -3025,6 +3082,7 @@ def run(args: argparse.Namespace) -> None:
         "hellaswag_split": args.hellaswag_split,
         "hellaswag_enabled": hellaswag_enabled,
         "hellaswag_examples_loaded": len(hellaswag_examples),
+        "train_pool_refresh_interval": args.train_pool_refresh_interval,
         "auto_seq_len_by_memory": args.auto_seq_len_by_memory,
         "auto_disable_distill_for_memory": args.auto_disable_distill_for_memory,
         "distill_disable_param_threshold": args.distill_disable_param_threshold,
@@ -3075,6 +3133,7 @@ def run(args: argparse.Namespace) -> None:
             f"avg_dispatch_ms={r['avg_dispatch_ms']}, avg_sync_ms={r['avg_sync_ms']}, "
             f"avg_tokens_per_s={r['avg_tokens_per_s']}, "
             f"final_hellaswag_acc={r['final_hellaswag_acc']}, "
+            f"train_pool_refreshes={r['train_pool_refreshes']}, "
             f"warmup_compile_estimate_s={r['warmup_compile_estimate_s']}, "
             f"angle={angle}, radial={radial}"
         )
@@ -3170,6 +3229,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--hellaswag-dataset-name", type=str, default="Rowan/hellaswag")
     p.add_argument("--hellaswag-dataset-config", type=str, default=None)
     p.add_argument("--hellaswag-split", type=str, default="validation")
+    p.add_argument("--train-pool-refresh-interval", type=int, default=0)
     p.add_argument("--shift-start-frac", type=float, default=0.5)
     p.add_argument("--train-rare-token-prob", type=float, default=0.03)
     p.add_argument("--eval-rare-token-prob", type=float, default=0.08)

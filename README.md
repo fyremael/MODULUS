@@ -66,6 +66,7 @@ python scripts/run_benchmarks.py \
   --inference-sampler-temperature 1.0 \
   --hellaswag-eval-interval 100 \
   --hellaswag-max-examples 128 \
+  --train-pool-refresh-interval 250 \
   --auto-token-pool-by-host-ram \
   --host-ram-token-pool-fraction 0.20 \
   --dataset-http-cache-dir artifacts/datasets/hf_http_cache \
@@ -95,6 +96,8 @@ proxies into `benchmark_steps.csv`.
 Progress-quality hooks: `--inference-sampler-interval` writes periodic generation samples
 to `inference_samples.jsonl` (temperature defaults to `1.0`), and
 `--hellaswag-eval-interval` tracks HellaSwag accuracy over training.
+For long real-data runs, set `--train-pool-refresh-interval` (for example `250`) so
+training does not overfit a fixed token pool.
 Optional profiler capture: `--profile-trace --profile-trace-dir <path>` and/or
 `--profile-server-port <port>` for TensorBoard profiler attachment.
 Hardware-aware mode is on by default and can downshift `batch_size` or
@@ -129,7 +132,8 @@ python scripts/run_benchmarks.py \
   --inference-sampler-interval 500 \
   --inference-sampler-temperature 1.0 \
   --hellaswag-eval-interval 500 \
-  --hellaswag-max-examples 256
+  --hellaswag-max-examples 256 \
+  --train-pool-refresh-interval 250
 ```
 
 Build benchmark report from CSV artifacts:
