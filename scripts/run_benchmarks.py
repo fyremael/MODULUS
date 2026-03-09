@@ -110,6 +110,7 @@ class DatasetConfig:
     http_cache_write: bool
     tokenizer_backend: str
     tokenizer_name: Optional[str]
+    token_id_projection: str
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,8 @@ class TextTokenizerAdapter:
     decode_tokens: Optional[Callable[[Sequence[int]], str]]
     backend: str
     name: Optional[str]
+    token_id_projection: str
+    stats: Optional[Callable[[], Mapping[str, float]]]
 
 
 @dataclass(frozen=True)
@@ -1155,7 +1158,7 @@ def _text_to_ids(text: str, *, vocab_size: int, max_doc_tokens: int) -> List[int
     return ids
 
 
-def _remap_external_token_ids_to_vocab(
+def _remap_external_token_ids_mod(
     token_ids: Sequence[int],
     *,
     vocab_size: int,
@@ -1172,14 +1175,67 @@ def _remap_external_token_ids_to_vocab(
     return [1, *body, 2]
 
 
+def _make_external_token_id_table_projector(
+    *,
+    vocab_size: int,
+    max_doc_tokens: int,
+) -> Tuple[Callable[[Sequence[int]], List[int]], Callable[[], Mapping[str, float]]]:
+    if vocab_size <= 3:
+        raise ValueError("vocab_size must be > 3 for table projection")
+    ext_to_local: Dict[int, int] = {}
+    next_local = 3
+    unk_local = 3
+    mapped_tokens = 0
+    oov_tokens = 0
+
+    def project(token_ids: Sequence[int]) -> List[int]:
+        nonlocal next_local, mapped_tokens, oov_tokens
+        if not token_ids:
+            return []
+        budget = max(max_doc_tokens, 2)
+        body_budget = max(0, budget - 2)
+        body: List[int] = []
+        for tok in token_ids[:body_budget]:
+            ext = int(tok)
+            local = ext_to_local.get(ext)
+            if local is None:
+                if next_local < vocab_size:
+                    local = next_local
+                    ext_to_local[ext] = local
+                    next_local += 1
+                else:
+                    local = unk_local
+                    oov_tokens += 1
+            mapped_tokens += 1
+            body.append(local)
+        return [1, *body, 2]
+
+    def stats() -> Mapping[str, float]:
+        capacity = max(vocab_size - 3, 1)
+        return {
+            "table_unique_external_ids": float(len(ext_to_local)),
+            "table_capacity": float(capacity),
+            "table_fill_fraction": float(len(ext_to_local)) / float(capacity),
+            "table_mapped_tokens": float(mapped_tokens),
+            "table_oov_tokens": float(oov_tokens),
+            "table_oov_fraction": (
+                float(oov_tokens) / float(mapped_tokens) if mapped_tokens > 0 else 0.0
+            ),
+        }
+
+    return project, stats
+
+
 def _build_text_tokenizer(
     *,
     backend: str,
     tokenizer_name: Optional[str],
     vocab_size: int,
     max_doc_tokens: int,
+    token_id_projection: str,
 ) -> TextTokenizerAdapter:
     backend_norm = backend.strip().lower()
+    projection_norm = token_id_projection.strip().lower()
     if backend_norm == "hash":
         return TextTokenizerAdapter(
             encode_text=lambda text: _text_to_ids(
@@ -1188,6 +1244,8 @@ def _build_text_tokenizer(
             decode_tokens=None,
             backend=backend_norm,
             name=tokenizer_name,
+            token_id_projection="hash",
+            stats=None,
         )
 
     if backend_norm == "tiktoken":
@@ -1221,15 +1279,31 @@ def _build_text_tokenizer(
             toks = [int(t) for t in token_ids]
             return encoding.decode(toks)
 
-        return TextTokenizerAdapter(
-            encode_text=lambda text: _remap_external_token_ids_to_vocab(
+        if projection_norm == "mod":
+            encode_text = lambda text: _remap_external_token_ids_mod(  # noqa: E731
                 encode(text),
                 vocab_size=vocab_size,
                 max_doc_tokens=max_doc_tokens,
-            ),
+            )
+            stats_fn = None
+        elif projection_norm == "table":
+            project, stats_fn = _make_external_token_id_table_projector(
+                vocab_size=vocab_size,
+                max_doc_tokens=max_doc_tokens,
+            )
+            encode_text = lambda text: project(encode(text))  # noqa: E731
+        else:
+            raise ValueError(
+                "--dataset-token-id-projection must be one of: table, mod"
+            )
+
+        return TextTokenizerAdapter(
+            encode_text=encode_text,
             decode_tokens=decode_tokens,
             backend=backend_norm,
             name=name,
+            token_id_projection=projection_norm,
+            stats=stats_fn,
         )
 
     if backend_norm == "hf_auto":
@@ -1258,15 +1332,31 @@ def _build_text_tokenizer(
         def decode_tokens(token_ids: Sequence[int]) -> str:
             return hf_tok.decode([int(t) for t in token_ids], skip_special_tokens=False)
 
-        return TextTokenizerAdapter(
-            encode_text=lambda text: _remap_external_token_ids_to_vocab(
+        if projection_norm == "mod":
+            encode_text = lambda text: _remap_external_token_ids_mod(  # noqa: E731
                 hf_tok.encode(text, add_special_tokens=False),
                 vocab_size=vocab_size,
                 max_doc_tokens=max_doc_tokens,
-            ),
+            )
+            stats_fn = None
+        elif projection_norm == "table":
+            project, stats_fn = _make_external_token_id_table_projector(
+                vocab_size=vocab_size,
+                max_doc_tokens=max_doc_tokens,
+            )
+            encode_text = lambda text: project(hf_tok.encode(text, add_special_tokens=False))  # noqa: E731
+        else:
+            raise ValueError(
+                "--dataset-token-id-projection must be one of: table, mod"
+            )
+
+        return TextTokenizerAdapter(
+            encode_text=encode_text,
             decode_tokens=decode_tokens,
             backend=backend_norm,
             name=tokenizer_name,
+            token_id_projection=projection_norm,
+            stats=stats_fn,
         )
 
     raise ValueError(
@@ -1753,6 +1843,9 @@ def run(args: argparse.Namespace) -> None:
     tokenizer_name = args.dataset_tokenizer_name
     if tokenizer_name is not None:
         tokenizer_name = tokenizer_name.strip() or None
+    token_id_projection = args.dataset_token_id_projection.strip().lower()
+    if token_id_projection not in {"table", "mod"}:
+        raise ValueError("--dataset-token-id-projection must be one of: table, mod")
     if (
         args.data_source in {"hf_stream", "hf_http"}
         and tokenizer_backend == "hf_auto"
@@ -1947,6 +2040,7 @@ def run(args: argparse.Namespace) -> None:
         http_cache_write=args.dataset_http_cache_write,
         tokenizer_backend=tokenizer_backend,
         tokenizer_name=tokenizer_name,
+        token_id_projection=token_id_projection,
     )
     mask = _causal_mask(args.seq_len)
 
@@ -2050,6 +2144,7 @@ def run(args: argparse.Namespace) -> None:
             tokenizer_name=ds_cfg.tokenizer_name,
             vocab_size=args.vocab_size,
             max_doc_tokens=ds_cfg.max_doc_tokens,
+            token_id_projection=ds_cfg.token_id_projection,
         )
         tokenize_text = tokenizer_adapter.encode_text
         holdout_fraction = float(args.dataset_eval_holdout_fraction)
@@ -2071,7 +2166,8 @@ def run(args: argparse.Namespace) -> None:
         )
         print(
             "Dataset tokenizer: "
-            f"backend={ds_cfg.tokenizer_backend}, name={tokenizer_name_display}"
+            f"backend={ds_cfg.tokenizer_backend}, name={tokenizer_name_display}, "
+            f"projection={ds_cfg.token_id_projection}"
         )
         if train_eval_same_split and holdout_fraction > 0.0:
             print(
@@ -2175,6 +2271,17 @@ def run(args: argparse.Namespace) -> None:
             else:
                 raise
 
+    if tokenizer_adapter is not None and tokenizer_adapter.stats is not None:
+        tok_stats = tokenizer_adapter.stats()
+        print(
+            "Tokenizer projection stats: "
+            f"mode={tokenizer_adapter.token_id_projection}, "
+            f"fill={tok_stats.get('table_fill_fraction', float('nan')):.4f}, "
+            f"oov_frac={tok_stats.get('table_oov_fraction', float('nan')):.4f}, "
+            f"unique={int(tok_stats.get('table_unique_external_ids', 0.0))}/"
+            f"{int(tok_stats.get('table_capacity', 0.0))}"
+        )
+
     sampler_enabled = args.inference_sampler_interval > 0
     hellaswag_enabled = args.hellaswag_eval_interval > 0
     if (sampler_enabled or hellaswag_enabled) and tokenizer_adapter is None:
@@ -2183,6 +2290,7 @@ def run(args: argparse.Namespace) -> None:
             tokenizer_name=ds_cfg.tokenizer_name,
             vocab_size=args.vocab_size,
             max_doc_tokens=ds_cfg.max_doc_tokens,
+            token_id_projection=ds_cfg.token_id_projection,
         )
 
     hellaswag_examples: List[HellaSwagExample] = []
@@ -3241,6 +3349,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dataset-text-keys", type=str, default="text,content,document")
     p.add_argument("--dataset-tokenizer-backend", type=str, default="tiktoken")
     p.add_argument("--dataset-tokenizer-name", type=str, default=None)
+    p.add_argument("--dataset-token-id-projection", type=str, default="table")
     p.add_argument("--dataset-eval-holdout-fraction", type=float, default=0.01)
     p.add_argument("--dataset-shuffle-buffer", type=int, default=10000)
     p.add_argument("--dataset-max-doc-tokens", type=int, default=512)

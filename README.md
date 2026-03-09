@@ -83,6 +83,9 @@ send `Authorization: Bearer ...` to dataset-server.
 The default real-data tokenizer backend is `tiktoken` (`cl100k_base` by default).
 Alternative backends: `--dataset-tokenizer-backend hash` (legacy regex/hash) and
 `--dataset-tokenizer-backend hf_auto --dataset-tokenizer-name <hf_tokenizer_id>`.
+External token IDs are projected into model vocab with `--dataset-token-id-projection table`
+(default, stable ID table + UNK overflow). Legacy modulo projection remains available via
+`--dataset-token-id-projection mod`.
 When train and eval use the same split, set `--dataset-eval-holdout-fraction 0.01`
 to keep validation isolated as a deterministic 1% holdout.
 If rate-limited, increase `--dataset-http-max-retries` and
